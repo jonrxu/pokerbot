@@ -58,9 +58,19 @@ def generate_trajectories(
     
     # Load checkpoint if available
     if checkpoint_path and os.path.exists(f"/checkpoints/{checkpoint_path}"):
-        checkpoint = torch.load(f"/checkpoints/{checkpoint_path}", map_location='cpu', weights_only=False)
-        value_net.load_state_dict(checkpoint['value_net_state'])
-        policy_net.load_state_dict(checkpoint['policy_net_state'])
+        try:
+            checkpoint = torch.load(f"/checkpoints/{checkpoint_path}", map_location='cpu', weights_only=False)
+            # Validate checkpoint has required keys
+            required_keys = ['value_net_state', 'policy_net_state']
+            if all(key in checkpoint for key in required_keys):
+                value_net.load_state_dict(checkpoint['value_net_state'])
+                policy_net.load_state_dict(checkpoint['policy_net_state'])
+            else:
+                import logging
+                logging.warning(f"Checkpoint {checkpoint_path} missing required keys. Using new networks.")
+        except Exception as e:
+            import logging
+            logging.warning(f"Failed to load checkpoint {checkpoint_path}: {e}. Using new networks.")
     
     # Initialize Deep CFR
     deep_cfr = DeepCFR(
@@ -73,15 +83,20 @@ def generate_trajectories(
     
     # Load regret memory if available
     if checkpoint_path and os.path.exists(f"/checkpoints/{checkpoint_path}"):
-        if 'regret_memory' in checkpoint:
-            # Convert dict back to defaultdict if needed
-            from collections import defaultdict
-            if isinstance(checkpoint['regret_memory'], dict):
-                deep_cfr.regret_memory = defaultdict(lambda: defaultdict(float), 
-                    {k: defaultdict(float, v) if isinstance(v, dict) else v 
-                     for k, v in checkpoint['regret_memory'].items()})
-            else:
-                deep_cfr.regret_memory = checkpoint['regret_memory']
+        try:
+            checkpoint = torch.load(f"/checkpoints/{checkpoint_path}", map_location='cpu', weights_only=False)
+            if 'regret_memory' in checkpoint:
+                # Convert dict back to defaultdict if needed
+                from collections import defaultdict
+                if isinstance(checkpoint['regret_memory'], dict):
+                    deep_cfr.regret_memory = defaultdict(lambda: defaultdict(float), 
+                        {k: defaultdict(float, v) if isinstance(v, dict) else v 
+                         for k, v in checkpoint['regret_memory'].items()})
+                else:
+                    deep_cfr.regret_memory = checkpoint['regret_memory']
+        except Exception as e:
+            import logging
+            logging.warning(f"Failed to load regret memory from {checkpoint_path}: {e}. Using empty memory.")
     
     # Generate trajectories
     generator = SelfPlayGenerator(game, deep_cfr, num_trajectories=num_trajectories)
@@ -112,21 +127,35 @@ def train_networks(
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
+    # Log GPU availability
+    import logging
+    if device == 'cpu' and torch.cuda.is_available() == False:
+        logging.warning("GPU not available, falling back to CPU. Training will be slower.")
+    elif device == 'cuda':
+        logging.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+    
     # Initialize components
     game = PokerGame(small_blind=50, big_blind=100, is_limit=False)
     state_encoder = StateEncoder()
     input_dim = state_encoder.feature_dim
     
     # Load or create networks
+    value_net = ValuePolicyNet(input_dim=input_dim).to(device)
+    policy_net = ValuePolicyNet(input_dim=input_dim).to(device)
+    
     if checkpoint_path and os.path.exists(f"/checkpoints/{checkpoint_path}"):
-        checkpoint = torch.load(f"/checkpoints/{checkpoint_path}", map_location=device, weights_only=False)
-        value_net = ValuePolicyNet(input_dim=input_dim).to(device)
-        policy_net = ValuePolicyNet(input_dim=input_dim).to(device)
-        value_net.load_state_dict(checkpoint['value_net_state'])
-        policy_net.load_state_dict(checkpoint['policy_net_state'])
-    else:
-        value_net = ValuePolicyNet(input_dim=input_dim).to(device)
-        policy_net = ValuePolicyNet(input_dim=input_dim).to(device)
+        try:
+            checkpoint = torch.load(f"/checkpoints/{checkpoint_path}", map_location=device, weights_only=False)
+            # Validate checkpoint has required keys
+            required_keys = ['value_net_state', 'policy_net_state']
+            if all(key in checkpoint for key in required_keys):
+                value_net.load_state_dict(checkpoint['value_net_state'])
+                policy_net.load_state_dict(checkpoint['policy_net_state'])
+                logging.info(f"Successfully loaded checkpoint from {checkpoint_path}")
+            else:
+                logging.warning(f"Checkpoint {checkpoint_path} missing required keys. Using new networks.")
+        except Exception as e:
+            logging.warning(f"Failed to load checkpoint {checkpoint_path}: {e}. Using new networks.")
     
     # Initialize Deep CFR
     deep_cfr = DeepCFR(
@@ -139,31 +168,86 @@ def train_networks(
     
     # Load training state if available
     if checkpoint_path and os.path.exists(f"/checkpoints/{checkpoint_path}"):
-        checkpoint = torch.load(f"/checkpoints/{checkpoint_path}", map_location=device, weights_only=False)
-        if 'value_optimizer_state' in checkpoint:
-            deep_cfr.value_optimizer.load_state_dict(checkpoint['value_optimizer_state'])
-        if 'policy_optimizer_state' in checkpoint:
-            deep_cfr.policy_optimizer.load_state_dict(checkpoint['policy_optimizer_state'])
-        if 'regret_memory' in checkpoint:
-            # Convert dict back to defaultdict if needed
-            from collections import defaultdict
-            if isinstance(checkpoint['regret_memory'], dict):
-                deep_cfr.regret_memory = defaultdict(lambda: defaultdict(float), 
-                    {k: defaultdict(float, v) if isinstance(v, dict) else v 
-                     for k, v in checkpoint['regret_memory'].items()})
-            else:
-                deep_cfr.regret_memory = checkpoint['regret_memory']
-        if 'counterfactual_values' in checkpoint:
-            if isinstance(checkpoint['counterfactual_values'], dict):
-                deep_cfr.counterfactual_values = defaultdict(float, checkpoint['counterfactual_values'])
-            else:
-                deep_cfr.counterfactual_values = checkpoint['counterfactual_values']
+        try:
+            checkpoint = torch.load(f"/checkpoints/{checkpoint_path}", map_location=device, weights_only=False)
+            if 'value_optimizer_state' in checkpoint:
+                try:
+                    deep_cfr.value_optimizer.load_state_dict(checkpoint['value_optimizer_state'])
+                except Exception as e:
+                    logging.warning(f"Failed to load value optimizer state: {e}")
+            if 'policy_optimizer_state' in checkpoint:
+                try:
+                    deep_cfr.policy_optimizer.load_state_dict(checkpoint['policy_optimizer_state'])
+                except Exception as e:
+                    logging.warning(f"Failed to load policy optimizer state: {e}")
+            if 'regret_memory' in checkpoint:
+                try:
+                    # Convert dict back to defaultdict if needed
+                    from collections import defaultdict
+                    if isinstance(checkpoint['regret_memory'], dict):
+                        deep_cfr.regret_memory = defaultdict(lambda: defaultdict(float), 
+                            {k: defaultdict(float, v) if isinstance(v, dict) else v 
+                             for k, v in checkpoint['regret_memory'].items()})
+                    else:
+                        deep_cfr.regret_memory = checkpoint['regret_memory']
+                except Exception as e:
+                    logging.warning(f"Failed to load regret memory: {e}")
+            if 'counterfactual_values' in checkpoint:
+                try:
+                    if isinstance(checkpoint['counterfactual_values'], dict):
+                        deep_cfr.counterfactual_values = defaultdict(float, checkpoint['counterfactual_values'])
+                    else:
+                        deep_cfr.counterfactual_values = checkpoint['counterfactual_values']
+                except Exception as e:
+                    logging.warning(f"Failed to load counterfactual values: {e}")
+        except Exception as e:
+            logging.warning(f"Failed to load training state from {checkpoint_path}: {e}")
     
     # Process trajectories and update networks
     value_buffer = []
     policy_buffer = []
     
+    # Validate trajectory structure
+    def validate_trajectory(traj):
+        """Validate trajectory has required structure."""
+        required_keys = ['states', 'info_sets', 'payoffs', 'player']
+        if not isinstance(traj, dict):
+            return False
+        if not all(key in traj for key in required_keys):
+            return False
+        if not isinstance(traj['states'], list) or len(traj['states']) == 0:
+            return False
+        if not isinstance(traj['info_sets'], list) or len(traj['info_sets']) != len(traj['states']):
+            return False
+        if not isinstance(traj['payoffs'], (list, tuple)) or len(traj['payoffs']) != 2:
+            return False
+        if traj['player'] not in [0, 1]:
+            return False
+        return True
+    
+    valid_trajectories = []
+    invalid_count = 0
     for trajectory in trajectories:
+        if validate_trajectory(trajectory):
+            valid_trajectories.append(trajectory)
+        else:
+            invalid_count += 1
+    
+    if invalid_count > 0:
+        logging.warning(f"Skipped {invalid_count} invalid trajectories out of {len(trajectories)}")
+    
+    if len(valid_trajectories) == 0:
+        logging.error("No valid trajectories to process!")
+        return {
+            'iteration': iteration,
+            'value_loss': 0.0,
+            'policy_loss': 0.0,
+            'checkpoint_path': '',
+            'num_updates': 0,
+            'error': 'no_valid_trajectories'
+        }
+    
+    for trajectory in valid_trajectories:
         states = trajectory['states']
         info_sets = trajectory['info_sets']
         payoffs = trajectory['payoffs']
@@ -210,6 +294,7 @@ def train_networks(
     policy_losses = []
     
     if num_updates == 0:
+        logging.warning(f"No updates possible: value_buffer={len(value_buffer)}, policy_buffer={len(policy_buffer)}, batch_size={batch_size}")
         return {
             'iteration': iteration,
             'value_loss': 0.0,
@@ -217,6 +302,9 @@ def train_networks(
             'checkpoint_path': '',
             'num_updates': 0
         }
+    
+    # Gradient clipping threshold
+    max_grad_norm = 1.0
     
     for update_step in range(num_updates):
         # Update value network
@@ -228,7 +316,15 @@ def train_networks(
             deep_cfr.value_optimizer.zero_grad()
             predicted_values, _ = value_net(batch_states)
             value_loss = torch.nn.MSELoss()(predicted_values, batch_values)
+            
+            # Check for NaN/Inf
+            if torch.isnan(value_loss) or torch.isinf(value_loss):
+                logging.warning(f"Skipping value network update due to NaN/Inf loss at step {update_step}")
+                continue
+            
             value_loss.backward()
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(value_net.parameters(), max_grad_norm)
             deep_cfr.value_optimizer.step()
             value_losses.append(value_loss.item())
         
@@ -244,7 +340,15 @@ def train_networks(
             kl_loss = torch.nn.KLDivLoss(reduction='batchmean')(
                 torch.log(policy_probs + 1e-8), batch_probs
             )
+            
+            # Check for NaN/Inf
+            if torch.isnan(kl_loss) or torch.isinf(kl_loss):
+                logging.warning(f"Skipping policy network update due to NaN/Inf loss at step {update_step}")
+                continue
+            
             kl_loss.backward()
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_grad_norm)
             deep_cfr.policy_optimizer.step()
             policy_losses.append(kl_loss.item())
     
@@ -259,10 +363,40 @@ def train_networks(
         'counterfactual_values': dict(deep_cfr.counterfactual_values),
     }
     
-    # Save checkpoint
+    # Save checkpoint atomically (write to temp file, then rename)
     checkpoint_file = f"/checkpoints/checkpoint_iter_{iteration}.pt"
-    torch.save(checkpoint, checkpoint_file)
-    checkpoint_volume.commit()
+    temp_checkpoint_file = f"/checkpoints/checkpoint_iter_{iteration}.pt.tmp"
+    
+    try:
+        # Write to temp file first
+        torch.save(checkpoint, temp_checkpoint_file)
+        # Atomic rename
+        os.rename(temp_checkpoint_file, checkpoint_file)
+        logging.info(f"Checkpoint saved: {checkpoint_file}")
+    except Exception as e:
+        logging.error(f"Failed to save checkpoint: {e}")
+        # Clean up temp file if it exists
+        if os.path.exists(temp_checkpoint_file):
+            try:
+                os.remove(temp_checkpoint_file)
+            except:
+                pass
+        raise
+    
+    # Commit volume with retry logic
+    max_commit_retries = 3
+    for retry in range(max_commit_retries):
+        try:
+            checkpoint_volume.commit()
+            logging.info("Checkpoint volume committed successfully")
+            break
+        except Exception as e:
+            if retry == max_commit_retries - 1:
+                logging.error(f"Failed to commit checkpoint volume after {max_commit_retries} retries: {e}")
+                raise
+            logging.warning(f"Volume commit failed (retry {retry + 1}/{max_commit_retries}): {e}")
+            import time
+            time.sleep(1)  # Wait before retry
     
     avg_value_loss = sum(value_losses) / len(value_losses) if value_losses else 0.0
     avg_policy_loss = sum(policy_losses) / len(policy_losses) if policy_losses else 0.0
@@ -362,6 +496,18 @@ def training_worker(
     logger.info(f"Starting training: {num_iterations} iterations, {trajectories_per_iteration} trajectories/iter")
     logger.info(f"Starting from iteration {start_iteration}")
     
+    # Initialize iteration variable before try block for exception handling
+    iteration = start_iteration
+    
+    # Validate worker configuration
+    if num_workers > trajectories_per_iteration:
+        logger.error(f"num_workers ({num_workers}) > trajectories_per_iteration ({trajectories_per_iteration}). This will result in 0 trajectories per worker!")
+        raise ValueError(f"num_workers must be <= trajectories_per_iteration")
+    
+    if num_workers <= 0:
+        logger.error(f"num_workers must be > 0, got {num_workers}")
+        raise ValueError(f"num_workers must be > 0")
+    
     try:
         for iteration in range(start_iteration, num_iterations):
             logger.info(f"\n{'='*60}")
@@ -375,36 +521,106 @@ def training_worker(
             
             # Generate trajectories in parallel
             trajectories_per_worker = trajectories_per_iteration // num_workers
+            remainder = trajectories_per_iteration % num_workers
+            
             logger.info(f"Generating {trajectories_per_iteration} trajectories using {num_workers} workers...")
+            logger.info(f"Trajectories per worker: {trajectories_per_worker} (remainder: {remainder})")
             
             trajectory_futures = []
             for worker_id in range(num_workers):
+                # Distribute remainder to first few workers
+                worker_trajectories = trajectories_per_worker + (1 if worker_id < remainder else 0)
                 future = generate_trajectories.spawn(
-                    num_trajectories=trajectories_per_worker,
+                    num_trajectories=worker_trajectories,
                     checkpoint_path=checkpoint_path,
                     iteration=iteration
                 )
                 trajectory_futures.append(future)
             
-            # Collect trajectories
+            # Collect trajectories with retry logic
             all_trajectories = []
-            for i, future in enumerate(trajectory_futures):
-                trajectories = future.get()
-                all_trajectories.extend(trajectories)
-                logger.info(f"Worker {i+1}/{num_workers} completed: {len(trajectories)} trajectories")
+            max_worker_retries = 2
+            for i in range(num_workers):
+                retry_count = 0
+                worker_success = False
+                worker_trajectories = trajectories_per_worker + (1 if i < remainder else 0)
+                
+                while retry_count < max_worker_retries and not worker_success:
+                    try:
+                        # Get or create future for this worker
+                        if retry_count == 0:
+                            future = trajectory_futures[i]
+                        else:
+                            # Respawn worker on retry
+                            logger.warning(f"Worker {i+1} failed (attempt {retry_count}/{max_worker_retries}). Retrying...")
+                            future = generate_trajectories.spawn(
+                                num_trajectories=worker_trajectories,
+                                checkpoint_path=checkpoint_path,
+                                iteration=iteration
+                            )
+                        
+                        trajectories = future.get(timeout=3600)  # 1 hour timeout per worker
+                        all_trajectories.extend(trajectories)
+                        logger.info(f"Worker {i+1}/{num_workers} completed: {len(trajectories)} trajectories")
+                        worker_success = True
+                    except Exception as e:
+                        retry_count += 1
+                        if retry_count >= max_worker_retries:
+                            logger.error(f"Worker {i+1} failed after {max_worker_retries} attempts: {e}")
+                            # Continue with partial results rather than failing entire iteration
+                            logger.warning(f"Continuing with {len(all_trajectories)} trajectories from {i} workers")
+                            break
             
             logger.info(f"Total trajectories generated: {len(all_trajectories)}")
             
+            if len(all_trajectories) == 0:
+                logger.error("No trajectories generated! Skipping this iteration.")
+                # Log metrics for failed iteration
+                metrics = {
+                    "iteration": iteration + 1,
+                    "trajectories_generated": 0,
+                    "value_loss": 0.0,
+                    "policy_loss": 0.0,
+                    "checkpoint_path": '',
+                    "num_updates": 0,
+                    "error": "no_trajectories_generated"
+                }
+                try:
+                    metrics_logger.log_iteration(iteration + 1, metrics)
+                except Exception as e:
+                    logger.error(f"Failed to log metrics: {e}")
+                continue
+            
             # Train networks
             logger.info("Training networks on GPU...")
-            train_result = train_networks.spawn(
-                trajectories=all_trajectories,
-                checkpoint_path=checkpoint_path,
-                iteration=iteration,
-                batch_size=batch_size
-            ).get()
+            try:
+                train_result = train_networks.spawn(
+                    trajectories=all_trajectories,
+                    checkpoint_path=checkpoint_path,
+                    iteration=iteration,
+                    batch_size=batch_size
+                ).get(timeout=7200)  # 2 hour timeout
+            except Exception as e:
+                logger.error(f"Training networks failed: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                # Log error metrics
+                metrics = {
+                    "iteration": iteration + 1,
+                    "trajectories_generated": len(all_trajectories),
+                    "value_loss": 0.0,
+                    "policy_loss": 0.0,
+                    "checkpoint_path": '',
+                    "num_updates": 0,
+                    "error": str(e)
+                }
+                try:
+                    metrics_logger.log_iteration(iteration + 1, metrics)
+                except Exception as log_err:
+                    logger.error(f"Failed to log error metrics: {log_err}")
+                raise
             
-            # Log metrics
+            # Log metrics with error handling
             metrics = {
                 "iteration": iteration + 1,
                 "trajectories_generated": len(all_trajectories),
@@ -414,33 +630,74 @@ def training_worker(
                 "num_updates": train_result.get('num_updates', 0)
             }
             
-            metrics_logger.log_iteration(iteration + 1, metrics)
+            # Validate metrics for NaN/Inf
+            def is_valid_number(v):
+                """Check if value is a valid number (not NaN or Inf)."""
+                if not isinstance(v, (int, float)):
+                    return False
+                return v == v and v != float('inf') and v != float('-inf')
+            
+            if not is_valid_number(metrics['value_loss']) or not is_valid_number(metrics['policy_loss']):
+                logger.warning(f"NaN/Inf detected in metrics: {metrics}")
+                metrics['value_loss'] = 0.0 if not is_valid_number(metrics['value_loss']) else metrics['value_loss']
+                metrics['policy_loss'] = 0.0 if not is_valid_number(metrics['policy_loss']) else metrics['policy_loss']
+            
+            try:
+                metrics_logger.log_iteration(iteration + 1, metrics)
+            except Exception as e:
+                logger.error(f"Failed to log metrics: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                # Don't fail iteration due to metrics logging failure
             
             logger.info(f"Training complete:")
             logger.info(f"  Value loss: {metrics['value_loss']:.6f}")
             logger.info(f"  Policy loss: {metrics['policy_loss']:.6f}")
             logger.info(f"  Checkpoint: {metrics['checkpoint_path']}")
             
-            # Commit volume after every iteration for crash safety
-            checkpoint_volume.commit()
-            logger.info(f"✓ Checkpoint committed at iteration {iteration + 1}")
+            # Commit volume after every iteration for crash safety (with retry)
+            max_commit_retries = 3
+            commit_success = False
+            for retry in range(max_commit_retries):
+                try:
+                    checkpoint_volume.commit()
+                    logger.info(f"✓ Checkpoint committed at iteration {iteration + 1}")
+                    commit_success = True
+                    break
+                except Exception as e:
+                    if retry == max_commit_retries - 1:
+                        logger.error(f"Failed to commit checkpoint volume after {max_commit_retries} retries: {e}")
+                        # Don't fail iteration, but log error
+                    else:
+                        logger.warning(f"Volume commit failed (retry {retry + 1}/{max_commit_retries}): {e}")
+                        import time
+                        time.sleep(1)
             
             # Checkpoint periodically (informational)
             if (iteration + 1) % TRAINING_CONFIG['checkpoint_frequency'] == 0:
                 logger.info(f"✓ Major checkpoint milestone at iteration {iteration + 1}")
     
     except Exception as e:
-        logger.error(f"Training interrupted at iteration {iteration + 1}: {e}")
+        logger.error(f"Training interrupted at iteration {iteration}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         logger.error("Attempting final checkpoint commit...")
-        checkpoint_volume.commit()
+        try:
+            checkpoint_volume.commit()
+            logger.info("✓ Final checkpoint committed despite error")
+        except Exception as commit_err:
+            logger.error(f"Failed to commit checkpoint volume: {commit_err}")
         raise
     finally:
         # Always commit at end
         logger.info("="*60)
         logger.info("Training complete!")
         logger.info("="*60)
-        checkpoint_volume.commit()
-        logger.info("✓ Final checkpoint committed")
+        try:
+            checkpoint_volume.commit()
+            logger.info("✓ Final checkpoint committed")
+        except Exception as e:
+            logger.error(f"Failed to commit final checkpoint: {e}")
     
     return {
         "status": "completed",
