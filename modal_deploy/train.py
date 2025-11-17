@@ -18,6 +18,19 @@ app = modal.App("poker-bot-training")
 @app.function(
     image=image,
     volumes={"/checkpoints": checkpoint_volume},
+    timeout=60,
+)
+def setup_metrics_dir():
+    """Initialize metrics directory."""
+    import os
+    os.makedirs("/checkpoints/metrics", exist_ok=True)
+    os.makedirs("/checkpoints/logs", exist_ok=True)
+    checkpoint_volume.commit()
+
+
+@app.function(
+    image=image,
+    volumes={"/checkpoints": checkpoint_volume},
     **CPU_CONFIG,
     timeout=3600,
 )
@@ -196,7 +209,16 @@ def train_networks(
     value_losses = []
     policy_losses = []
     
-    for _ in range(num_updates):
+    if num_updates == 0:
+        return {
+            'iteration': iteration,
+            'value_loss': 0.0,
+            'policy_loss': 0.0,
+            'checkpoint_path': '',
+            'num_updates': 0
+        }
+    
+    for update_step in range(num_updates):
         # Update value network
         if len(value_buffer) >= batch_size:
             indices = torch.randint(0, len(value_buffer), (batch_size,))
@@ -242,11 +264,17 @@ def train_networks(
     torch.save(checkpoint, checkpoint_file)
     checkpoint_volume.commit()
     
+    avg_value_loss = sum(value_losses) / len(value_losses) if value_losses else 0.0
+    avg_policy_loss = sum(policy_losses) / len(policy_losses) if policy_losses else 0.0
+    
     return {
         'iteration': iteration,
-        'value_loss': sum(value_losses) / len(value_losses) if value_losses else 0.0,
-        'policy_loss': sum(policy_losses) / len(policy_losses) if policy_losses else 0.0,
-        'checkpoint_path': checkpoint_file
+        'value_loss': avg_value_loss,
+        'policy_loss': avg_policy_loss,
+        'checkpoint_path': checkpoint_file,
+        'num_updates': num_updates,
+        'value_buffer_size': len(value_buffer),
+        'policy_buffer_size': len(policy_buffer)
     }
 
 
@@ -292,20 +320,50 @@ def evaluate_agents(
     return results
 
 
-@app.local_entrypoint()
-def main(
-    num_iterations: int = 1000,
-    trajectories_per_iteration: int = 10000,
-    num_workers: int = 4,
-    resume_from: int = None
+@app.function(
+    image=image,
+    volumes={"/checkpoints": checkpoint_volume},
+    timeout=86400,  # 24 hours
+)
+def training_worker(
+    num_iterations: int,
+    trajectories_per_iteration: int,
+    num_workers: int,
+    start_iteration: int = 0,
+    batch_size: int = 32
 ):
-    """Main training loop."""
-    print(f"Starting training: {num_iterations} iterations, {trajectories_per_iteration} trajectories/iter")
+    """Main training worker that runs asynchronously."""
+    import logging
+    import sys
+    from modal_deploy.metrics import MetricsLogger
     
-    start_iteration = resume_from if resume_from else 0
+    # Set up logging to both file and stdout
+    log_file = '/checkpoints/training.log'
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler(sys.stdout)
+        ],
+        force=True
+    )
+    logger = logging.getLogger(__name__)
+    
+    # Initialize metrics directory
+    import os
+    os.makedirs("/checkpoints/metrics", exist_ok=True)
+    
+    # Initialize metrics logger
+    metrics_logger = MetricsLogger(log_dir="/checkpoints/metrics")
+    
+    logger.info(f"Starting training: {num_iterations} iterations, {trajectories_per_iteration} trajectories/iter")
+    logger.info(f"Starting from iteration {start_iteration}")
     
     for iteration in range(start_iteration, num_iterations):
-        print(f"\n=== Iteration {iteration + 1}/{num_iterations} ===")
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Iteration {iteration + 1}/{num_iterations}")
+        logger.info(f"{'='*60}")
         
         # Determine checkpoint path
         checkpoint_path = None
@@ -314,6 +372,8 @@ def main(
         
         # Generate trajectories in parallel
         trajectories_per_worker = trajectories_per_iteration // num_workers
+        logger.info(f"Generating {trajectories_per_iteration} trajectories using {num_workers} workers...")
+        
         trajectory_futures = []
         for worker_id in range(num_workers):
             future = generate_trajectories.spawn(
@@ -325,26 +385,143 @@ def main(
         
         # Collect trajectories
         all_trajectories = []
-        for future in trajectory_futures:
+        for i, future in enumerate(trajectory_futures):
             trajectories = future.get()
             all_trajectories.extend(trajectories)
+            logger.info(f"Worker {i+1}/{num_workers} completed: {len(trajectories)} trajectories")
         
-        print(f"Generated {len(all_trajectories)} trajectories")
+        logger.info(f"Total trajectories generated: {len(all_trajectories)}")
         
         # Train networks
+        logger.info("Training networks on GPU...")
         train_result = train_networks.spawn(
             trajectories=all_trajectories,
             checkpoint_path=checkpoint_path,
             iteration=iteration,
-            batch_size=TRAINING_CONFIG['batch_size']
+            batch_size=batch_size
         ).get()
         
-        print(f"Training complete: value_loss={train_result['value_loss']:.4f}, "
-              f"policy_loss={train_result['policy_loss']:.4f}")
+        # Log metrics
+        metrics = {
+            "iteration": iteration + 1,
+            "trajectories_generated": len(all_trajectories),
+            "value_loss": train_result.get('value_loss', 0.0),
+            "policy_loss": train_result.get('policy_loss', 0.0),
+            "checkpoint_path": train_result.get('checkpoint_path', ''),
+            "num_updates": train_result.get('num_updates', 0)
+        }
+        
+        metrics_logger.log_iteration(iteration + 1, metrics)
+        
+        logger.info(f"Training complete:")
+        logger.info(f"  Value loss: {metrics['value_loss']:.6f}")
+        logger.info(f"  Policy loss: {metrics['policy_loss']:.6f}")
+        logger.info(f"  Checkpoint: {metrics['checkpoint_path']}")
         
         # Checkpoint periodically
         if (iteration + 1) % TRAINING_CONFIG['checkpoint_frequency'] == 0:
-            print(f"Checkpoint saved at iteration {iteration + 1}")
+            logger.info(f"✓ Checkpoint saved at iteration {iteration + 1}")
+            checkpoint_volume.commit()
+        
+        # Commit volume periodically to ensure persistence
+        if (iteration + 1) % 10 == 0:
+            checkpoint_volume.commit()
+            logger.info("✓ Volume committed")
     
-    print("Training complete!")
+    logger.info("="*60)
+    logger.info("Training complete!")
+    logger.info("="*60)
+    
+    # Final commit
+    checkpoint_volume.commit()
+    
+    return {
+        "status": "completed",
+        "total_iterations": num_iterations,
+        "final_metrics": metrics_logger.get_summary()
+    }
+
+
+@app.local_entrypoint()
+def main(
+    num_iterations: int = 1000,
+    trajectories_per_iteration: int = 10000,
+    num_workers: int = 4,
+    resume_from: int = None,
+    batch_size: int = 32,
+    deploy: bool = False
+):
+    """Main entrypoint for training.
+    
+    Args:
+        num_iterations: Number of training iterations
+        trajectories_per_iteration: Trajectories per iteration
+        num_workers: Number of parallel workers for trajectory generation
+        resume_from: Iteration to resume from (None = start from beginning)
+        batch_size: Batch size for network training
+        deploy: If True, deploy as async job. If False, run synchronously.
+    """
+    start_iteration = resume_from if resume_from else 0
+    
+    if deploy:
+        # Initialize metrics directory
+        print("Setting up metrics directory...")
+        try:
+            setup_metrics_dir.remote()
+        except:
+            pass  # May already exist
+        
+        # Deploy as async job
+        print("\n" + "="*60)
+        print("Deploying training job to Modal (async)...")
+        print("="*60)
+        print(f"Configuration:")
+        print(f"  Iterations: {num_iterations}")
+        print(f"  Trajectories per iteration: {trajectories_per_iteration}")
+        print(f"  Workers: {num_workers}")
+        print(f"  Batch size: {batch_size}")
+        if start_iteration > 0:
+            print(f"  Resuming from iteration: {start_iteration}")
+        print()
+        
+        # Spawn async job - this returns immediately, function runs independently
+        future = training_worker.spawn(
+            num_iterations=num_iterations,
+            trajectories_per_iteration=trajectories_per_iteration,
+            num_workers=num_workers,
+            start_iteration=start_iteration,
+            batch_size=batch_size
+        )
+        
+        # Note: spawn() returns immediately, function executes asynchronously
+        # The future object can be used to check status later if needed
+        
+        print("="*60)
+        print("✓ Job submitted successfully!")
+        print("="*60)
+        print(f"Function Call ID: {future.object_id}")
+        print()
+        print("The training worker is now running independently on Modal.")
+        print("You can close this terminal - the job will continue running.")
+        print()
+        print("Monitor progress:")
+        print(f"  - Modal dashboard: https://modal.com/apps")
+        print(f"  - Check status: ./scripts/check_status.sh")
+        print(f"  - View metrics: python scripts/view_metrics.py")
+        print()
+        print("Note: Metrics and logs will appear in Modal volume after first iteration.")
+        print()
+        
+    else:
+        # Run synchronously
+        print(f"Starting training: {num_iterations} iterations, {trajectories_per_iteration} trajectories/iter")
+        result = training_worker.remote(
+            num_iterations=num_iterations,
+            trajectories_per_iteration=trajectories_per_iteration,
+            num_workers=num_workers,
+            start_iteration=start_iteration,
+            batch_size=batch_size
+        )
+        print("\nTraining complete!")
+        print(f"Final summary: {result.get('final_metrics', {})}")
 

@@ -36,6 +36,10 @@ image = (
         os.path.join(project_root, "checkpoints"),
         "/root/checkpoints"
     )
+    .add_local_dir(
+        os.path.join(project_root, "modal_deploy"),
+        "/root/modal_deploy"
+    )
 )
 
 # Volume for checkpoints and data
