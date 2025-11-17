@@ -1,13 +1,19 @@
-"""Entry point for Modal training."""
+"""Entry point for Modal training.
 
-import modal
+Usage:
+    modal run modal_train.py::app.main --num-iterations 1000 --trajectories-per-iteration 10000 --num-workers 4
+"""
+
+# Import modules so Modal uploads them
+import poker_game
+import models
+import training
+import evaluation
+import checkpoints
 
 # Import the Modal app
-from modal.train import app
+from modal_deploy.train import app
 
 if __name__ == "__main__":
-    # Run training via Modal
-    with app.run():
-        # This will be called via: modal run modal_train.py
-        pass
+    pass
 

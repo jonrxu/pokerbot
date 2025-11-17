@@ -2,22 +2,15 @@
 
 import modal
 import torch
-import pickle
 import os
 from typing import List, Dict, Any
 import sys
 
-# Add parent directory to path
+# Add parent directory to path for local imports
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, parent_dir)
 
-from modal.config import image, checkpoint_volume, GPU_CONFIG, CPU_CONFIG, TRAINING_CONFIG
-from poker_game.game import PokerGame
-from poker_game.state_encoder import StateEncoder
-from poker_game.information_set import InformationSet, get_information_set
-from models.value_policy_net import ValuePolicyNet
-from training.deep_cfr import DeepCFR
-from training.self_play import SelfPlayGenerator
+from modal_deploy.config import image, checkpoint_volume, GPU_CONFIG, CPU_CONFIG, TRAINING_CONFIG
 
 app = modal.App("poker-bot-training")
 
@@ -34,24 +27,27 @@ def generate_trajectories(
     iteration: int = 0
 ) -> List[Dict]:
     """Generate self-play trajectories (CPU workers)."""
+    from collections import defaultdict
+    from poker_game.game import PokerGame
+    from poker_game.state_encoder import StateEncoder
+    from models.value_policy_net import ValuePolicyNet
+    from training.deep_cfr import DeepCFR
+    from training.self_play import SelfPlayGenerator
+    
     # Initialize game
     game = PokerGame(small_blind=50, big_blind=100, is_limit=False)
     state_encoder = StateEncoder()
     
     # Load or create networks
+    input_dim = state_encoder.feature_dim
+    value_net = ValuePolicyNet(input_dim=input_dim)
+    policy_net = ValuePolicyNet(input_dim=input_dim)
+    
+    # Load checkpoint if available
     if checkpoint_path and os.path.exists(f"/checkpoints/{checkpoint_path}"):
-        # Load checkpoint
-        checkpoint = torch.load(f"/checkpoints/{checkpoint_path}", map_location='cpu')
-        input_dim = state_encoder.feature_dim
-        value_net = ValuePolicyNet(input_dim=input_dim)
-        policy_net = ValuePolicyNet(input_dim=input_dim)
+        checkpoint = torch.load(f"/checkpoints/{checkpoint_path}", map_location='cpu', weights_only=False)
         value_net.load_state_dict(checkpoint['value_net_state'])
         policy_net.load_state_dict(checkpoint['policy_net_state'])
-    else:
-        # Create new networks
-        input_dim = state_encoder.feature_dim
-        value_net = ValuePolicyNet(input_dim=input_dim)
-        policy_net = ValuePolicyNet(input_dim=input_dim)
     
     # Initialize Deep CFR
     deep_cfr = DeepCFR(
@@ -64,9 +60,15 @@ def generate_trajectories(
     
     # Load regret memory if available
     if checkpoint_path and os.path.exists(f"/checkpoints/{checkpoint_path}"):
-        checkpoint = torch.load(f"/checkpoints/{checkpoint_path}", map_location='cpu')
         if 'regret_memory' in checkpoint:
-            deep_cfr.regret_memory = checkpoint['regret_memory']
+            # Convert dict back to defaultdict if needed
+            from collections import defaultdict
+            if isinstance(checkpoint['regret_memory'], dict):
+                deep_cfr.regret_memory = defaultdict(lambda: defaultdict(float), 
+                    {k: defaultdict(float, v) if isinstance(v, dict) else v 
+                     for k, v in checkpoint['regret_memory'].items()})
+            else:
+                deep_cfr.regret_memory = checkpoint['regret_memory']
     
     # Generate trajectories
     generator = SelfPlayGenerator(game, deep_cfr, num_trajectories=num_trajectories)
@@ -88,6 +90,13 @@ def train_networks(
     batch_size: int = 32
 ) -> Dict[str, Any]:
     """Train networks on trajectories (GPU workers)."""
+    import numpy as np
+    from collections import defaultdict
+    from poker_game.game import PokerGame
+    from poker_game.state_encoder import StateEncoder
+    from models.value_policy_net import ValuePolicyNet
+    from training.deep_cfr import DeepCFR
+    
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     # Initialize components
@@ -97,7 +106,7 @@ def train_networks(
     
     # Load or create networks
     if checkpoint_path and os.path.exists(f"/checkpoints/{checkpoint_path}"):
-        checkpoint = torch.load(f"/checkpoints/{checkpoint_path}", map_location=device)
+        checkpoint = torch.load(f"/checkpoints/{checkpoint_path}", map_location=device, weights_only=False)
         value_net = ValuePolicyNet(input_dim=input_dim).to(device)
         policy_net = ValuePolicyNet(input_dim=input_dim).to(device)
         value_net.load_state_dict(checkpoint['value_net_state'])
@@ -117,15 +126,25 @@ def train_networks(
     
     # Load training state if available
     if checkpoint_path and os.path.exists(f"/checkpoints/{checkpoint_path}"):
-        checkpoint = torch.load(f"/checkpoints/{checkpoint_path}", map_location=device)
+        checkpoint = torch.load(f"/checkpoints/{checkpoint_path}", map_location=device, weights_only=False)
         if 'value_optimizer_state' in checkpoint:
             deep_cfr.value_optimizer.load_state_dict(checkpoint['value_optimizer_state'])
         if 'policy_optimizer_state' in checkpoint:
             deep_cfr.policy_optimizer.load_state_dict(checkpoint['policy_optimizer_state'])
         if 'regret_memory' in checkpoint:
-            deep_cfr.regret_memory = checkpoint['regret_memory']
+            # Convert dict back to defaultdict if needed
+            from collections import defaultdict
+            if isinstance(checkpoint['regret_memory'], dict):
+                deep_cfr.regret_memory = defaultdict(lambda: defaultdict(float), 
+                    {k: defaultdict(float, v) if isinstance(v, dict) else v 
+                     for k, v in checkpoint['regret_memory'].items()})
+            else:
+                deep_cfr.regret_memory = checkpoint['regret_memory']
         if 'counterfactual_values' in checkpoint:
-            deep_cfr.counterfactual_values = checkpoint['counterfactual_values']
+            if isinstance(checkpoint['counterfactual_values'], dict):
+                deep_cfr.counterfactual_values = defaultdict(float, checkpoint['counterfactual_values'])
+            else:
+                deep_cfr.counterfactual_values = checkpoint['counterfactual_values']
     
     # Process trajectories and update networks
     value_buffer = []
@@ -181,7 +200,7 @@ def train_networks(
         # Update value network
         if len(value_buffer) >= batch_size:
             indices = torch.randint(0, len(value_buffer), (batch_size,))
-            batch_states = torch.tensor([value_buffer[i][0] for i in indices], dtype=torch.float32).to(device)
+            batch_states = torch.tensor(np.array([value_buffer[i][0] for i in indices]), dtype=torch.float32).to(device)
             batch_values = torch.tensor([value_buffer[i][1] for i in indices], dtype=torch.float32).to(device).unsqueeze(1)
             
             deep_cfr.value_optimizer.zero_grad()
@@ -194,7 +213,7 @@ def train_networks(
         # Update policy network
         if len(policy_buffer) >= batch_size:
             indices = torch.randint(0, len(policy_buffer), (batch_size,))
-            batch_states = torch.tensor([policy_buffer[i][0] for i in indices], dtype=torch.float32).to(device)
+            batch_states = torch.tensor(np.array([policy_buffer[i][0] for i in indices]), dtype=torch.float32).to(device)
             batch_probs = torch.tensor([policy_buffer[i][1] for i in indices], dtype=torch.float32).to(device)
             
             deep_cfr.policy_optimizer.zero_grad()
@@ -248,7 +267,7 @@ def evaluate_agents(
     agents = {}
     for path in checkpoint_paths:
         if os.path.exists(f"/checkpoints/{path}"):
-            checkpoint = torch.load(f"/checkpoints/{path}", map_location='cpu')
+            checkpoint = torch.load(f"/checkpoints/{path}", map_location='cpu', weights_only=False)
             # Create agent from checkpoint
             agents[path] = checkpoint
     

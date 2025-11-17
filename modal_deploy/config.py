@@ -1,8 +1,13 @@
 """Modal configuration for distributed training."""
 
 import modal
+import os
 
-# Modal image with dependencies
+# Get the project root directory
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Modal image with dependencies and local code
+# Use add_local_dir to include code directories in the image
 image = (
     modal.Image.debian_slim(python_version="3.10")
     .pip_install(
@@ -10,6 +15,26 @@ image = (
         "numpy>=1.24.0",
         "tqdm>=4.65.0",
         "pandas>=2.0.0",
+    )
+    .add_local_dir(
+        os.path.join(project_root, "poker_game"),
+        "/root/poker_game"
+    )
+    .add_local_dir(
+        os.path.join(project_root, "models"),
+        "/root/models"
+    )
+    .add_local_dir(
+        os.path.join(project_root, "training"),
+        "/root/training"
+    )
+    .add_local_dir(
+        os.path.join(project_root, "evaluation"),
+        "/root/evaluation"
+    )
+    .add_local_dir(
+        os.path.join(project_root, "checkpoints"),
+        "/root/checkpoints"
     )
 )
 
