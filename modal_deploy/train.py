@@ -323,6 +323,8 @@ def evaluate_agents(
 @app.function(
     image=image,
     volumes={"/checkpoints": checkpoint_volume},
+    cpu=2,
+    memory=4096,
     timeout=86400,  # 24 hours
 )
 def training_worker(
@@ -360,80 +362,85 @@ def training_worker(
     logger.info(f"Starting training: {num_iterations} iterations, {trajectories_per_iteration} trajectories/iter")
     logger.info(f"Starting from iteration {start_iteration}")
     
-    for iteration in range(start_iteration, num_iterations):
-        logger.info(f"\n{'='*60}")
-        logger.info(f"Iteration {iteration + 1}/{num_iterations}")
-        logger.info(f"{'='*60}")
-        
-        # Determine checkpoint path
-        checkpoint_path = None
-        if iteration > 0:
-            checkpoint_path = f"checkpoint_iter_{iteration - 1}.pt"
-        
-        # Generate trajectories in parallel
-        trajectories_per_worker = trajectories_per_iteration // num_workers
-        logger.info(f"Generating {trajectories_per_iteration} trajectories using {num_workers} workers...")
-        
-        trajectory_futures = []
-        for worker_id in range(num_workers):
-            future = generate_trajectories.spawn(
-                num_trajectories=trajectories_per_worker,
+    try:
+        for iteration in range(start_iteration, num_iterations):
+            logger.info(f"\n{'='*60}")
+            logger.info(f"Iteration {iteration + 1}/{num_iterations}")
+            logger.info(f"{'='*60}")
+            
+            # Determine checkpoint path
+            checkpoint_path = None
+            if iteration > 0:
+                checkpoint_path = f"checkpoint_iter_{iteration - 1}.pt"
+            
+            # Generate trajectories in parallel
+            trajectories_per_worker = trajectories_per_iteration // num_workers
+            logger.info(f"Generating {trajectories_per_iteration} trajectories using {num_workers} workers...")
+            
+            trajectory_futures = []
+            for worker_id in range(num_workers):
+                future = generate_trajectories.spawn(
+                    num_trajectories=trajectories_per_worker,
+                    checkpoint_path=checkpoint_path,
+                    iteration=iteration
+                )
+                trajectory_futures.append(future)
+            
+            # Collect trajectories
+            all_trajectories = []
+            for i, future in enumerate(trajectory_futures):
+                trajectories = future.get()
+                all_trajectories.extend(trajectories)
+                logger.info(f"Worker {i+1}/{num_workers} completed: {len(trajectories)} trajectories")
+            
+            logger.info(f"Total trajectories generated: {len(all_trajectories)}")
+            
+            # Train networks
+            logger.info("Training networks on GPU...")
+            train_result = train_networks.spawn(
+                trajectories=all_trajectories,
                 checkpoint_path=checkpoint_path,
-                iteration=iteration
-            )
-            trajectory_futures.append(future)
-        
-        # Collect trajectories
-        all_trajectories = []
-        for i, future in enumerate(trajectory_futures):
-            trajectories = future.get()
-            all_trajectories.extend(trajectories)
-            logger.info(f"Worker {i+1}/{num_workers} completed: {len(trajectories)} trajectories")
-        
-        logger.info(f"Total trajectories generated: {len(all_trajectories)}")
-        
-        # Train networks
-        logger.info("Training networks on GPU...")
-        train_result = train_networks.spawn(
-            trajectories=all_trajectories,
-            checkpoint_path=checkpoint_path,
-            iteration=iteration,
-            batch_size=batch_size
-        ).get()
-        
-        # Log metrics
-        metrics = {
-            "iteration": iteration + 1,
-            "trajectories_generated": len(all_trajectories),
-            "value_loss": train_result.get('value_loss', 0.0),
-            "policy_loss": train_result.get('policy_loss', 0.0),
-            "checkpoint_path": train_result.get('checkpoint_path', ''),
-            "num_updates": train_result.get('num_updates', 0)
-        }
-        
-        metrics_logger.log_iteration(iteration + 1, metrics)
-        
-        logger.info(f"Training complete:")
-        logger.info(f"  Value loss: {metrics['value_loss']:.6f}")
-        logger.info(f"  Policy loss: {metrics['policy_loss']:.6f}")
-        logger.info(f"  Checkpoint: {metrics['checkpoint_path']}")
-        
-        # Checkpoint periodically
-        if (iteration + 1) % TRAINING_CONFIG['checkpoint_frequency'] == 0:
-            logger.info(f"✓ Checkpoint saved at iteration {iteration + 1}")
+                iteration=iteration,
+                batch_size=batch_size
+            ).get()
+            
+            # Log metrics
+            metrics = {
+                "iteration": iteration + 1,
+                "trajectories_generated": len(all_trajectories),
+                "value_loss": train_result.get('value_loss', 0.0),
+                "policy_loss": train_result.get('policy_loss', 0.0),
+                "checkpoint_path": train_result.get('checkpoint_path', ''),
+                "num_updates": train_result.get('num_updates', 0)
+            }
+            
+            metrics_logger.log_iteration(iteration + 1, metrics)
+            
+            logger.info(f"Training complete:")
+            logger.info(f"  Value loss: {metrics['value_loss']:.6f}")
+            logger.info(f"  Policy loss: {metrics['policy_loss']:.6f}")
+            logger.info(f"  Checkpoint: {metrics['checkpoint_path']}")
+            
+            # Commit volume after every iteration for crash safety
             checkpoint_volume.commit()
-        
-        # Commit volume periodically to ensure persistence
-        if (iteration + 1) % 10 == 0:
-            checkpoint_volume.commit()
-            logger.info("✓ Volume committed")
+            logger.info(f"✓ Checkpoint committed at iteration {iteration + 1}")
+            
+            # Checkpoint periodically (informational)
+            if (iteration + 1) % TRAINING_CONFIG['checkpoint_frequency'] == 0:
+                logger.info(f"✓ Major checkpoint milestone at iteration {iteration + 1}")
     
-    logger.info("="*60)
-    logger.info("Training complete!")
-    logger.info("="*60)
-    
-    # Final commit
-    checkpoint_volume.commit()
+    except Exception as e:
+        logger.error(f"Training interrupted at iteration {iteration + 1}: {e}")
+        logger.error("Attempting final checkpoint commit...")
+        checkpoint_volume.commit()
+        raise
+    finally:
+        # Always commit at end
+        logger.info("="*60)
+        logger.info("Training complete!")
+        logger.info("="*60)
+        checkpoint_volume.commit()
+        logger.info("✓ Final checkpoint committed")
     
     return {
         "status": "completed",
@@ -471,9 +478,9 @@ def main(
         except:
             pass  # May already exist
         
-        # Deploy as async job
+        # Deploy app for async execution
         print("\n" + "="*60)
-        print("Deploying training job to Modal (async)...")
+        print("Deploying app to Modal...")
         print("="*60)
         print(f"Configuration:")
         print(f"  Iterations: {num_iterations}")
@@ -484,7 +491,18 @@ def main(
             print(f"  Resuming from iteration: {start_iteration}")
         print()
         
-        # Spawn async job - this returns immediately, function runs independently
+        # Deploy the app first to make functions available
+        print("Deploying app to Modal...")
+        with modal.enable_output():
+            app.deploy()
+        
+        print("="*60)
+        print("✓ App deployed successfully!")
+        print("="*60)
+        print()
+        print("Triggering training job...")
+        
+        # Now spawn the training worker - app is deployed so it will run independently
         future = training_worker.spawn(
             num_iterations=num_iterations,
             trajectories_per_iteration=trajectories_per_iteration,
@@ -493,13 +511,12 @@ def main(
             batch_size=batch_size
         )
         
-        # Note: spawn() returns immediately, function executes asynchronously
-        # The future object can be used to check status later if needed
+        # Give it a moment to start before exiting
+        import time
+        print("Waiting for function to start...")
+        time.sleep(3)  # Give Modal time to allocate container
         
-        print("="*60)
-        print("✓ Job submitted successfully!")
-        print("="*60)
-        print(f"Function Call ID: {future.object_id}")
+        print(f"✓ Training job triggered! Function Call ID: {future.object_id}")
         print()
         print("The training worker is now running independently on Modal.")
         print("You can close this terminal - the job will continue running.")
