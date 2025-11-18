@@ -71,6 +71,26 @@ python scripts/view_metrics.py
 - **Expected duration:** 3-7 days (~80-160 hours)
 - **Expected cost:** $8-16 (within $30 budget)
 
+## LLM Training with Tinker
+
+To train the LLM-based agent using Reinforcement Learning on the Tinker platform:
+
+1.  **Setup Tinker**: Ensure you have the `poker_bot_tinker` environment active and your `TINKER_API_KEY` set.
+2.  **Self-Play Training**: Run the self-play training loop where the model plays against itself.
+    ```bash
+    python scripts/train_selfplay.py \
+      --model-name Qwen/Qwen3-4B-Instruct-2507 \
+      --num-batches 10 \
+      --episodes-per-batch 16 \
+      --log-path /tmp/tinker-examples/rl_poker_selfplay
+    ```
+3.  **Evaluation**: Evaluate the trained model against baselines or checkpoints.
+    ```bash
+    python scripts/tinker_vs_checkpoint.py \
+      --checkpoint-iter 195 \
+      --rl-log-path /tmp/tinker-examples/rl_poker_selfplay
+    ```
+
 ## Robustness Features
 
 The training system includes comprehensive error handling:
