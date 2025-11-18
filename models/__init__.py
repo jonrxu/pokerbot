@@ -1,7 +1,7 @@
 """Neural network models for poker bot."""
 
 from .poker_net import PokerNet
-from .value_policy_net import ValuePolicyNet
+from .advantage_net import AdvantageNet
+from .policy_net import PolicyNet
 
-__all__ = ['PokerNet', 'ValuePolicyNet']
-
+__all__ = ['PokerNet', 'AdvantageNet', 'PolicyNet']

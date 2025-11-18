@@ -47,7 +47,7 @@ def evaluate_against_baseline_modal(
     import random
     from poker_game.game import PokerGame, GameState, Action
     from poker_game.state_encoder import StateEncoder
-    from models.value_policy_net import ValuePolicyNet
+    from models.policy_net import PolicyNet
     
     # Define baseline agents inline
     class RandomAgent:
@@ -135,7 +135,7 @@ def evaluate_against_baseline_modal(
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         input_dim = state_encoder.feature_dim
-        policy_net = ValuePolicyNet(input_dim=input_dim)
+        policy_net = PolicyNet(input_dim=input_dim)
         if 'policy_net_state' in checkpoint:
             policy_net.load_state_dict(checkpoint['policy_net_state'])
         else:
@@ -274,7 +274,7 @@ def evaluate_checkpoints_modal(
     import numpy as np
     from poker_game.game import PokerGame
     from poker_game.state_encoder import StateEncoder
-    from models.value_policy_net import ValuePolicyNet
+    from models.policy_net import PolicyNet
     from evaluation.evaluator import Evaluator
     
     print(f"Evaluating iteration {iteration1} vs iteration {iteration2}")
@@ -289,7 +289,7 @@ def evaluate_checkpoints_modal(
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         input_dim = state_encoder.feature_dim
-        policy_net = ValuePolicyNet(input_dim=input_dim)
+        policy_net = PolicyNet(input_dim=input_dim)
         if 'policy_net_state' in checkpoint:
             policy_net.load_state_dict(checkpoint['policy_net_state'])
         else:
