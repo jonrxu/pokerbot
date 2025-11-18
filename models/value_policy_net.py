@@ -38,19 +38,31 @@ class ValuePolicyNet(PokerNet):
                     if layer.bias is not None:
                         nn.init.constant_(layer.bias, 0)
     
-    def forward(self, x):
-        """Forward pass returning value and policy."""
+    def forward(self, x, clip_value: bool = True):
+        """Forward pass returning value and policy.
+        
+        Args:
+            x: Input state encoding
+            clip_value: If True, clip value output to prevent unbounded predictions
+        """
         features = super().forward(x)
         
         value = self.value_head(features)
+        # Clip value predictions to prevent unbounded growth
+        if clip_value:
+            value = torch.clamp(value, -10000.0, 10000.0)
+        
         policy_logits = self.policy_head(features)
         
         return value, policy_logits
     
-    def get_value(self, x):
+    def get_value(self, x, clip_value: bool = True):
         """Get value estimate only."""
         features = super().forward(x)
-        return self.value_head(features)
+        value = self.value_head(features)
+        if clip_value:
+            value = torch.clamp(value, -10000.0, 10000.0)
+        return value
     
     def get_policy(self, x, legal_actions_mask=None):
         """Get policy probabilities for legal actions."""

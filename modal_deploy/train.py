@@ -3,7 +3,7 @@
 import modal
 import torch
 import os
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 import sys
 
 # Add parent directory to path for local imports
@@ -39,7 +39,12 @@ def generate_trajectories(
     checkpoint_path: str = None,
     iteration: int = 0
 ) -> List[Dict]:
-    """Generate self-play trajectories (CPU workers)."""
+    """Generate self-play trajectories (CPU workers).
+
+    Uses the current CFR strategy derived from regret_memory for self-play.
+    Average strategy (strategy_memory) is not required here, but regret_memory
+    is loaded from checkpoints so that self-play reflects accumulated learning.
+    """
     from collections import defaultdict
     from poker_game.game import PokerGame
     from poker_game.state_encoder import StateEncoder
@@ -72,16 +77,19 @@ def generate_trajectories(
             import logging
             logging.warning(f"Failed to load checkpoint {checkpoint_path}: {e}. Using new networks.")
     
-    # Initialize Deep CFR
+    # Initialize Deep CFR with reduced value learning rate for stability
+    # and a slightly lower policy learning rate for smoother policy updates.
     deep_cfr = DeepCFR(
         value_net=value_net,
         policy_net=policy_net,
         state_encoder=state_encoder,
         game=game,
+        learning_rate=5e-5,
+        value_learning_rate=5e-5,  # Lower LR for value network to prevent instability
         device='cpu'
     )
     
-    # Load regret memory if available
+    # Load regret / strategy memory if available
     if checkpoint_path and os.path.exists(f"/checkpoints/{checkpoint_path}"):
         try:
             checkpoint = torch.load(f"/checkpoints/{checkpoint_path}", map_location='cpu', weights_only=False)
@@ -94,6 +102,18 @@ def generate_trajectories(
                          for k, v in checkpoint['regret_memory'].items()})
                 else:
                     deep_cfr.regret_memory = checkpoint['regret_memory']
+            if 'strategy_memory' in checkpoint:
+                from collections import defaultdict
+                if isinstance(checkpoint['strategy_memory'], dict):
+                    deep_cfr.strategy_memory = defaultdict(
+                        lambda: defaultdict(float),
+                        {
+                            k: defaultdict(float, v) if isinstance(v, dict) else v
+                            for k, v in checkpoint['strategy_memory'].items()
+                        },
+                    )
+                else:
+                    deep_cfr.strategy_memory = checkpoint['strategy_memory']
         except Exception as e:
             import logging
             logging.warning(f"Failed to load regret memory from {checkpoint_path}: {e}. Using empty memory.")
@@ -122,17 +142,41 @@ def train_networks(
     from collections import defaultdict
     from poker_game.game import PokerGame
     from poker_game.state_encoder import StateEncoder
+    from poker_game.information_set import get_information_set
     from models.value_policy_net import ValuePolicyNet
     from training.deep_cfr import DeepCFR
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    # Scale CFVs to keep value targets numerically sane.
+    # We use starting stack (20,000 chips) as the scale, so CFVs are O(1).
+    CFV_SCALE = 20000.0
+    
+    # Enable mixed precision training for 2x GPU speedup
+    use_amp = device == 'cuda'
+    scaler = None
+    if use_amp:
+        from torch.amp import autocast, GradScaler
+        scaler = GradScaler('cuda')
     
     # Log GPU availability
     import logging
+    import sys
+    # Set up logging to ensure it goes to stdout
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[logging.StreamHandler(sys.stdout)],
+        force=True
+    )
+    logger = logging.getLogger(__name__)
+    
     if device == 'cpu' and torch.cuda.is_available() == False:
-        logging.warning("GPU not available, falling back to CPU. Training will be slower.")
+        logger.warning("GPU not available, falling back to CPU. Training will be slower.")
     elif device == 'cuda':
-        logging.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+        logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+        if use_amp:
+            logger.info("Mixed precision training (FP16) enabled for 2x speedup")
     
     # Initialize components
     game = PokerGame(small_blind=50, big_blind=100, is_limit=False)
@@ -157,12 +201,15 @@ def train_networks(
         except Exception as e:
             logging.warning(f"Failed to load checkpoint {checkpoint_path}: {e}. Using new networks.")
     
-    # Initialize Deep CFR
+    # Initialize Deep CFR with reduced value learning rate for stability
+    # and a slightly lower policy learning rate for smoother policy updates.
     deep_cfr = DeepCFR(
         value_net=value_net,
         policy_net=policy_net,
         state_encoder=state_encoder,
         game=game,
+        learning_rate=5e-5,
+        value_learning_rate=5e-5,  # Lower LR for value network to prevent instability
         device=device
     )
     
@@ -200,6 +247,21 @@ def train_networks(
                         deep_cfr.counterfactual_values = checkpoint['counterfactual_values']
                 except Exception as e:
                     logging.warning(f"Failed to load counterfactual values: {e}")
+            if 'strategy_memory' in checkpoint:
+                try:
+                    from collections import defaultdict
+                    if isinstance(checkpoint['strategy_memory'], dict):
+                        deep_cfr.strategy_memory = defaultdict(
+                            lambda: defaultdict(float),
+                            {
+                                k: defaultdict(float, v) if isinstance(v, dict) else v
+                                for k, v in checkpoint['strategy_memory'].items()
+                            },
+                        )
+                    else:
+                        deep_cfr.strategy_memory = checkpoint['strategy_memory']
+                except Exception as e:
+                    logging.warning(f"Failed to load strategy memory: {e}")
         except Exception as e:
             logging.warning(f"Failed to load training state from {checkpoint_path}: {e}")
     
@@ -234,10 +296,10 @@ def train_networks(
             invalid_count += 1
     
     if invalid_count > 0:
-        logging.warning(f"Skipped {invalid_count} invalid trajectories out of {len(trajectories)}")
+        logger.warning(f"Skipped {invalid_count} invalid trajectories out of {len(trajectories)}")
     
     if len(valid_trajectories) == 0:
-        logging.error("No valid trajectories to process!")
+        logger.error("No valid trajectories to process!")
         return {
             'iteration': iteration,
             'value_loss': 0.0,
@@ -247,54 +309,241 @@ def train_networks(
             'error': 'no_valid_trajectories'
         }
     
-    for trajectory in valid_trajectories:
+    # Logging for trajectory processing
+    total_decision_points = 0
+    total_regrets_updated = 0
+    total_cf_values_computed = 0
+    
+    for traj_idx, trajectory in enumerate(valid_trajectories):
         states = trajectory['states']
         info_sets = trajectory['info_sets']
+        actions = trajectory['actions']  # List of (action_idx, action, amount)
         payoffs = trajectory['payoffs']
-        player = trajectory['player']
+        trajectory_player = trajectory['player']
         
-        # Process trajectory backwards
-        for i in range(len(states) - 1, -1, -1):
+        if traj_idx == 0:
+            logger.info(f"Processing trajectory {traj_idx + 1}/{len(valid_trajectories)}:")
+            logger.info(f"  States: {len(states)}, Actions: {len(actions)}, Player: {trajectory_player}")
+            logger.info(f"  Payoffs: {payoffs}")
+            logger.info(f"  Last state is_terminal: {states[-1].is_terminal if len(states) > 0 else 'N/A'}")
+        
+        # Process trajectory backwards using Monte Carlo CFR
+        # Track counterfactual values backwards through the trajectory
+        cf_values_after_state = {}  # Maps state index -> counterfactual value after this state
+        
+        # Start from terminal state
+        if len(states) > 0:
+            terminal_state = states[-1]
+            if terminal_state.is_terminal:
+                # Terminal payoff for the trajectory player (scale to keep values O(1))
+                terminal_cf_value = payoffs[trajectory_player] / CFV_SCALE
+                cf_values_after_state[len(states) - 1] = terminal_cf_value
+                if traj_idx == 0:
+                    logger.info(f"  Terminal CF value (scaled): {terminal_cf_value:.4f}")
+            else:
+                # If last state isn't terminal, use payoffs directly (scaled)
+                # This can happen if trajectory ended without storing terminal state
+                terminal_cf_value = payoffs[trajectory_player] / CFV_SCALE
+                cf_values_after_state[len(states) - 1] = terminal_cf_value
+                if traj_idx < 5:  # Only log first few to avoid spam
+                    logger.warning(f"Trajectory {traj_idx} last state not marked as terminal, using scaled payoffs directly")
+        
+        # Process backwards through trajectory
+        # Skip terminal state (last state) - start from second-to-last
+        start_idx = len(states) - 2 if len(states) > 1 else -1
+        for i in range(start_idx, -1, -1):
             state = states[i]
             info_set = info_sets[i]
             
+            # Skip terminal states - they have no legal actions
+            if state.is_terminal:
+                continue
+            
+            current_player = state.current_player
+            if current_player is None:
+                continue
+            
             # Encode state
-            state_encoding = state_encoder.encode(state, player)
+            state_encoding = state_encoder.encode(state, trajectory_player)
             
-            # Get counterfactual value
-            cf_value = deep_cfr.counterfactual_values.get(info_set.key, 0.0)
-            if cf_value == 0.0:
-                state_tensor = torch.tensor(state_encoding, dtype=torch.float32).unsqueeze(0).to(device)
-                with torch.no_grad():
-                    predicted_value, _ = value_net(state_tensor)
-                    cf_value = predicted_value.item()
-            
-            value_buffer.append((state_encoding, cf_value))
-            
-            # Get strategy
+            # Get legal actions and strategy
             legal_actions = game.get_legal_actions(state)
+            if len(legal_actions) == 0:
+                continue
+            
             strategy = deep_cfr.get_strategy(info_set, legal_actions)
             
-            # Convert to probability vector
-            max_actions = policy_net.max_actions
-            action_probs = [0.0] * max_actions
-            for action_idx, prob in strategy.items():
-                if action_idx < max_actions:
-                    action_probs[action_idx] = prob
+            # Validate strategy indices are within bounds
+            max_action_idx = len(legal_actions) - 1
+            valid_strategy = {idx: prob for idx, prob in strategy.items() if 0 <= idx <= max_action_idx}
+            if len(valid_strategy) == 0:
+                logger.warning(f"Skipping state: no valid strategy indices (legal_actions={len(legal_actions)}, strategy_keys={list(strategy.keys())})")
+                continue
             
-            total = sum(action_probs)
-            if total > 0:
-                action_probs = [p / total for p in action_probs]
-            
-            policy_buffer.append((state_encoding, action_probs))
+            # Compute counterfactual value for this state
+            # If this is the trajectory player's decision point
+            if current_player == trajectory_player:
+                total_decision_points += 1
+                
+                # Get the action that was actually taken
+                if i < len(actions):
+                    _, action_taken, amount_taken = actions[i]
+                    # Find the matching action in current legal_actions
+                    # This handles cases where legal_actions changed between generation and training
+                    action_idx_taken = None
+                    for idx, (action, amount) in enumerate(legal_actions):
+                        if action == action_taken and amount == amount_taken:
+                            action_idx_taken = idx
+                            break
+                    
+                    if action_idx_taken is None:
+                        # Action not found in current legal_actions - this can happen if state changed
+                        # Skip this state (it's a rare edge case)
+                        if traj_idx < 5:  # Only log first few to avoid spam
+                            logger.warning(f"Skipping state: action ({action_taken}, {amount_taken}) not found in legal_actions (len={len(legal_actions)})")
+                        continue
+                else:
+                    # Terminal state, use payoff (already scaled)
+                    cf_value = cf_values_after_state.get(i + 1, payoffs[trajectory_player] / CFV_SCALE)
+                    # Clip in scaled space
+                    cf_value = max(-10000.0 / CFV_SCALE, min(10000.0 / CFV_SCALE, cf_value))
+                    deep_cfr.counterfactual_values[info_set.key] = cf_value
+                    value_buffer.append((state_encoding, cf_value))
+                    total_cf_values_computed += 1
+                    continue
+                
+                # Get counterfactual value after taking this action
+                cf_value_after_action = cf_values_after_state.get(i + 1, 0.0)
+                
+                # Compute node counterfactual value (weighted sum over all actions)
+                node_cf_value = 0.0
+                strategy_sum = 0.0
+                for action_idx, prob in valid_strategy.items():
+                    strategy_sum += prob
+                    if action_idx == action_idx_taken:
+                        # Use actual outcome
+                        node_cf_value += prob * cf_value_after_action
+                    else:
+                        # For other actions, estimate using network or stored value
+                        # Create hypothetical next state
+                        # Double-check bounds (should be safe after validation above)
+                        if action_idx < 0 or action_idx >= len(legal_actions):
+                            logger.warning(f"Skipping action_idx={action_idx}: out of bounds (legal_actions={len(legal_actions)})")
+                            continue
+                        action, amount = legal_actions[action_idx]
+                        next_state = game.apply_action(state, action, amount)
+                        
+                        # Get counterfactual value for this action
+                        if next_state.is_terminal:
+                            # Terminal payoff in scaled space
+                            next_payoffs = game.get_payoff(next_state)
+                            other_action_cf_value = next_payoffs[trajectory_player] / CFV_SCALE
+                        else:
+                            # Use network prediction or stored value (already scaled)
+                            next_info_set = get_information_set(next_state, trajectory_player)
+                            if next_info_set.key in deep_cfr.counterfactual_values:
+                                other_action_cf_value = deep_cfr.counterfactual_values[next_info_set.key]
+                            else:
+                                # Predict using network if not in memory
+                                next_state_encoding = state_encoder.encode(next_state, trajectory_player)
+                                next_state_tensor = torch.tensor(next_state_encoding, dtype=torch.float32).unsqueeze(0).to(device)
+                                with torch.no_grad():
+                                    predicted_value, _ = value_net(next_state_tensor, clip_value=True)
+                                    other_action_cf_value = predicted_value.item()
+                                    # Clip in scaled space
+                                    other_action_cf_value = max(-10000.0 / CFV_SCALE, min(10000.0 / CFV_SCALE, other_action_cf_value))
+                        
+                        node_cf_value += prob * other_action_cf_value
+                
+                # Validate strategy sums to 1
+                if abs(strategy_sum - 1.0) > 0.01:
+                    logger.warning(f"Strategy doesn't sum to 1: {strategy_sum} (info_set: {info_set.key[:30]}...)")
+                
+                # Update regrets for this information set
+                key = info_set.key
+                regret = cf_value_after_action - node_cf_value
+                old_regret = deep_cfr.regret_memory[key].get(action_idx_taken, 0.0)
+                deep_cfr.regret_memory[key][action_idx_taken] += regret
+                new_regret = deep_cfr.regret_memory[key][action_idx_taken]
+                total_regrets_updated += 1
+                
+                # Log first few regret updates for debugging
+                if total_regrets_updated <= 5:
+                    logger.info(f"  Regret update #{total_regrets_updated}:")
+                    logger.info(f"    Info set: {key[:40]}...")
+                    logger.info(f"    Action: {action_idx_taken}, CF after action: {cf_value_after_action:.2f}, Node CF: {node_cf_value:.2f}")
+                    logger.info(f"    Regret: {regret:.2f}, Old regret: {old_regret:.2f}, New regret: {new_regret:.2f}")
+                
+                # Clip regrets to prevent unbounded growth
+                for action_idx in deep_cfr.regret_memory[key]:
+                    deep_cfr.regret_memory[key][action_idx] = max(
+                        -100000.0, min(100000.0, deep_cfr.regret_memory[key][action_idx])
+                    )
+                
+                # Store counterfactual value for this state (scaled)
+                cf_value = max(-10000.0 / CFV_SCALE, min(10000.0 / CFV_SCALE, node_cf_value))
+                deep_cfr.counterfactual_values[key] = cf_value
+                cf_values_after_state[i] = cf_value
+                total_cf_values_computed += 1
+                
+                # Add to value buffer
+                value_buffer.append((state_encoding, cf_value))
+                
+                # --- NEW: accumulate strategy for average strategy computation ---
+                for a_idx, prob in valid_strategy.items():
+                    deep_cfr.strategy_memory[key][a_idx] += prob
+                
+                # Convert average strategy to probability vector for policy training
+                max_actions = policy_net.max_actions
+                action_probs = [0.0] * max_actions
+                avg_strategy = deep_cfr.compute_average_strategy(info_set, legal_actions)
+                for action_idx, prob in avg_strategy.items():
+                    if action_idx < max_actions:
+                        action_probs[action_idx] = prob
+                
+                total = sum(action_probs)
+                if total > 0:
+                    action_probs = [p / total for p in action_probs]
+                else:
+                    # Uniform if no strategy
+                    num_legal = min(max_actions, len(legal_actions))
+                    action_probs = [1.0 / num_legal] * num_legal + [0.0] * (max_actions - num_legal)
+                
+                policy_buffer.append((state_encoding, action_probs))
+            else:
+                # Opponent's decision point - just propagate value forward
+                cf_value = cf_values_after_state.get(i + 1, 0.0)
+                cf_values_after_state[i] = cf_value
+    
+    # Log trajectory processing summary
+    logger.info(f"\n{'='*60}")
+    logger.info(f"TRAJECTORY PROCESSING SUMMARY")
+    logger.info(f"{'='*60}")
+    logger.info(f"  Total trajectories: {len(valid_trajectories)}")
+    logger.info(f"  Total decision points processed: {total_decision_points}")
+    logger.info(f"  Total regrets updated: {total_regrets_updated}")
+    logger.info(f"  Total CF values computed: {total_cf_values_computed}")
+    logger.info(f"  Value buffer size: {len(value_buffer)}")
+    logger.info(f"  Policy buffer size: {len(policy_buffer)}")
+    logger.info(f"  Unique info sets with regrets: {len(deep_cfr.regret_memory)}")
+    logger.info(f"  Unique info sets with CF values: {len(deep_cfr.counterfactual_values)}")
     
     # Train networks
-    num_updates = min(100, len(value_buffer) // batch_size)
+    # Increased to 300 for better learning per iteration (with larger buffers)
+    num_updates = min(300, len(value_buffer) // batch_size)
     value_losses = []
     policy_losses = []
     
+    logger.info(f"\n{'='*60}")
+    logger.info(f"NETWORK TRAINING")
+    logger.info(f"{'='*60}")
+    logger.info(f"  Value buffer size: {len(value_buffer)}")
+    logger.info(f"  Policy buffer size: {len(policy_buffer)}")
+    logger.info(f"  Batch size: {batch_size}")
+    logger.info(f"  Max updates: {num_updates}")
+    
     if num_updates == 0:
-        logging.warning(f"No updates possible: value_buffer={len(value_buffer)}, policy_buffer={len(policy_buffer)}, batch_size={batch_size}")
+        logger.warning(f"No updates possible: value_buffer={len(value_buffer)}, policy_buffer={len(policy_buffer)}, batch_size={batch_size}")
         return {
             'iteration': iteration,
             'value_loss': 0.0,
@@ -307,25 +556,55 @@ def train_networks(
     max_grad_norm = 1.0
     
     for update_step in range(num_updates):
+        # Log progress every 20 updates
+        if update_step % 20 == 0 and update_step > 0:
+            avg_value_loss = sum(value_losses) / len(value_losses) if value_losses else 0.0
+            avg_policy_loss = sum(policy_losses) / len(policy_losses) if policy_losses else 0.0
+            logger.info(f"  Update {update_step}/{num_updates}: Value loss={avg_value_loss:.4f}, Policy loss={avg_policy_loss:.4f}")
+        
         # Update value network
         if len(value_buffer) >= batch_size:
             indices = torch.randint(0, len(value_buffer), (batch_size,))
             batch_states = torch.tensor(np.array([value_buffer[i][0] for i in indices]), dtype=torch.float32).to(device)
+            # CFVs are stored in scaled units (chips / CFV_SCALE)
             batch_values = torch.tensor([value_buffer[i][1] for i in indices], dtype=torch.float32).to(device).unsqueeze(1)
             
             deep_cfr.value_optimizer.zero_grad()
-            predicted_values, _ = value_net(batch_states)
-            value_loss = torch.nn.MSELoss()(predicted_values, batch_values)
             
-            # Check for NaN/Inf
-            if torch.isnan(value_loss) or torch.isinf(value_loss):
-                logging.warning(f"Skipping value network update due to NaN/Inf loss at step {update_step}")
-                continue
+            # Use mixed precision for faster training
+            if use_amp:
+                from torch.amp import autocast
+                with autocast('cuda'):
+                    predicted_values, _ = value_net(batch_states, clip_value=True)
+                    # Clip targets in scaled space
+                    batch_values_clipped = torch.clamp(batch_values, -10000.0 / CFV_SCALE, 10000.0 / CFV_SCALE)
+                    value_loss = torch.nn.MSELoss()(predicted_values, batch_values_clipped)
+                
+                # Check for NaN/Inf
+                if torch.isnan(value_loss) or torch.isinf(value_loss):
+                    logger.warning(f"Skipping value network update due to NaN/Inf loss at step {update_step}")
+                    continue
+                
+                scaler.scale(value_loss).backward()
+                scaler.unscale_(deep_cfr.value_optimizer)
+                torch.nn.utils.clip_grad_norm_(value_net.parameters(), max_grad_norm)
+                scaler.step(deep_cfr.value_optimizer)
+                scaler.update()
+            else:
+                predicted_values, _ = value_net(batch_states, clip_value=True)
+                # Clip targets in scaled space
+                batch_values_clipped = torch.clamp(batch_values, -10000.0 / CFV_SCALE, 10000.0 / CFV_SCALE)
+                value_loss = torch.nn.MSELoss()(predicted_values, batch_values_clipped)
+                
+                # Check for NaN/Inf
+                if torch.isnan(value_loss) or torch.isinf(value_loss):
+                    logger.warning(f"Skipping value network update due to NaN/Inf loss at step {update_step}")
+                    continue
+                
+                value_loss.backward()
+                torch.nn.utils.clip_grad_norm_(value_net.parameters(), max_grad_norm)
+                deep_cfr.value_optimizer.step()
             
-            value_loss.backward()
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(value_net.parameters(), max_grad_norm)
-            deep_cfr.value_optimizer.step()
             value_losses.append(value_loss.item())
         
         # Update policy network
@@ -335,21 +614,43 @@ def train_networks(
             batch_probs = torch.tensor([policy_buffer[i][1] for i in indices], dtype=torch.float32).to(device)
             
             deep_cfr.policy_optimizer.zero_grad()
-            _, policy_logits = policy_net(batch_states)
-            policy_probs = torch.softmax(policy_logits, dim=1)
-            kl_loss = torch.nn.KLDivLoss(reduction='batchmean')(
-                torch.log(policy_probs + 1e-8), batch_probs
-            )
             
-            # Check for NaN/Inf
-            if torch.isnan(kl_loss) or torch.isinf(kl_loss):
-                logging.warning(f"Skipping policy network update due to NaN/Inf loss at step {update_step}")
-                continue
+            # Use mixed precision for faster training
+            if use_amp:
+                from torch.amp import autocast
+                with autocast('cuda'):
+                    _, policy_logits = policy_net(batch_states)
+                    policy_probs = torch.softmax(policy_logits, dim=1)
+                    kl_loss = torch.nn.KLDivLoss(reduction='batchmean')(
+                        torch.log(policy_probs + 1e-8), batch_probs
+                    )
+                
+                # Check for NaN/Inf
+                if torch.isnan(kl_loss) or torch.isinf(kl_loss):
+                    logger.warning(f"Skipping policy network update due to NaN/Inf loss at step {update_step}")
+                    continue
+                
+                scaler.scale(kl_loss).backward()
+                scaler.unscale_(deep_cfr.policy_optimizer)
+                torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_grad_norm)
+                scaler.step(deep_cfr.policy_optimizer)
+                scaler.update()
+            else:
+                _, policy_logits = policy_net(batch_states)
+                policy_probs = torch.softmax(policy_logits, dim=1)
+                kl_loss = torch.nn.KLDivLoss(reduction='batchmean')(
+                    torch.log(policy_probs + 1e-8), batch_probs
+                )
+                
+                # Check for NaN/Inf
+                if torch.isnan(kl_loss) or torch.isinf(kl_loss):
+                    logger.warning(f"Skipping policy network update due to NaN/Inf loss at step {update_step}")
+                    continue
+                
+                kl_loss.backward()
+                torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_grad_norm)
+                deep_cfr.policy_optimizer.step()
             
-            kl_loss.backward()
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_grad_norm)
-            deep_cfr.policy_optimizer.step()
             policy_losses.append(kl_loss.item())
     
     # Prepare updated checkpoint
@@ -361,6 +662,7 @@ def train_networks(
         'policy_optimizer_state': deep_cfr.policy_optimizer.state_dict(),
         'regret_memory': dict(deep_cfr.regret_memory),
         'counterfactual_values': dict(deep_cfr.counterfactual_values),
+        'strategy_memory': dict(deep_cfr.strategy_memory),
     }
     
     # Save checkpoint atomically (write to temp file, then rename)
@@ -372,9 +674,9 @@ def train_networks(
         torch.save(checkpoint, temp_checkpoint_file)
         # Atomic rename
         os.rename(temp_checkpoint_file, checkpoint_file)
-        logging.info(f"Checkpoint saved: {checkpoint_file}")
+        logger.info(f"Checkpoint saved: {checkpoint_file}")
     except Exception as e:
-        logging.error(f"Failed to save checkpoint: {e}")
+        logger.error(f"Failed to save checkpoint: {e}")
         # Clean up temp file if it exists
         if os.path.exists(temp_checkpoint_file):
             try:
@@ -388,13 +690,13 @@ def train_networks(
     for retry in range(max_commit_retries):
         try:
             checkpoint_volume.commit()
-            logging.info("Checkpoint volume committed successfully")
+            logger.info("Checkpoint volume committed successfully")
             break
         except Exception as e:
             if retry == max_commit_retries - 1:
-                logging.error(f"Failed to commit checkpoint volume after {max_commit_retries} retries: {e}")
+                logger.error(f"Failed to commit checkpoint volume after {max_commit_retries} retries: {e}")
                 raise
-            logging.warning(f"Volume commit failed (retry {retry + 1}/{max_commit_retries}): {e}")
+            logger.warning(f"Volume commit failed (retry {retry + 1}/{max_commit_retries}): {e}")
             import time
             time.sleep(1)  # Wait before retry
     
@@ -452,6 +754,117 @@ def evaluate_agents(
             }
     
     return results
+
+
+def small_evaluation(iteration: int, num_games: int = 200) -> Dict[str, Any]:
+    """
+    Run a small evaluation of the current checkpoint against simple baselines.
+    This is used inside the training loop for cheap sanity checks.
+    """
+    import os
+    import random
+    import numpy as np
+    import torch
+    from poker_game.game import PokerGame, Action
+    from poker_game.state_encoder import StateEncoder
+    from models.value_policy_net import ValuePolicyNet
+
+    checkpoint_path = f"/checkpoints/checkpoint_iter_{iteration}.pt"
+    if not os.path.exists(checkpoint_path):
+        return {}
+
+    # Initialize game and state encoder
+    game = PokerGame(small_blind=50, big_blind=100, is_limit=False)
+    encoder = StateEncoder()
+    input_dim = encoder.feature_dim
+
+    # Load current policy network
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if "policy_net_state" not in checkpoint:
+        return {}
+    current_net = ValuePolicyNet(input_dim=input_dim)
+    current_net.load_state_dict(checkpoint["policy_net_state"])
+    current_net.eval()
+
+    # Baseline agents
+    class RandomAgent:
+        def get_action(self, state, legal_actions):
+            if not legal_actions:
+                return (Action.FOLD, 0)
+            return random.choice(legal_actions)
+
+    class AlwaysCallAgent:
+        def get_action(self, state, legal_actions):
+            to_call = state.current_bets[1 - state.current_player] - state.current_bets[state.current_player]
+            if to_call == 0:
+                for a, amt in legal_actions:
+                    if a == Action.CHECK:
+                        return (a, amt)
+            else:
+                for a, amt in legal_actions:
+                    if a == Action.CALL:
+                        return (a, amt)
+            return (Action.FOLD, 0)
+
+    def play_match(opponent, num_games: int) -> Tuple[float, float]:
+        wins = 0
+        total_payoff = 0.0
+        for _ in range(num_games):
+            state = game.reset()
+            # Randomly assign positions
+            current_is_player0 = random.random() < 0.5
+
+            while not state.is_terminal:
+                player = state.current_player
+                legal_actions = game.get_legal_actions(state)
+                if not legal_actions:
+                    break
+
+                if (player == 0 and current_is_player0) or (player == 1 and not current_is_player0):
+                    # Current bot's turn
+                    enc = encoder.encode(state, player)
+                    t = torch.tensor(enc, dtype=torch.float32).unsqueeze(0)
+                    with torch.no_grad():
+                        _, logits = current_net(t)
+                        probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
+                    num_legal = len(legal_actions)
+                    legal_probs = probs[:num_legal]
+                    if legal_probs.sum() > 0:
+                        legal_probs /= legal_probs.sum()
+                    else:
+                        legal_probs = np.ones(num_legal) / num_legal
+                    idx = np.random.choice(num_legal, p=legal_probs)
+                    action, amount = legal_actions[idx]
+                else:
+                    # Opponent's turn
+                    action, amount = opponent.get_action(state, legal_actions)
+
+                state = game.apply_action(state, action, amount)
+
+            payoffs = game.get_payoff(state)
+            if current_is_player0:
+                total_payoff += payoffs[0]
+                if payoffs[0] > payoffs[1]:
+                    wins += 1
+            else:
+                total_payoff += payoffs[1]
+                if payoffs[1] > payoffs[0]:
+                    wins += 1
+
+        return wins / num_games, total_payoff / num_games
+
+    random_agent = RandomAgent()
+    always_call_agent = AlwaysCallAgent()
+
+    rand_wr, rand_ev = play_match(random_agent, num_games)
+    call_wr, call_ev = play_match(always_call_agent, num_games)
+
+    return {
+        "eval_random_win_rate": rand_wr,
+        "eval_random_ev": rand_ev,
+        "eval_always_call_win_rate": call_wr,
+        "eval_always_call_ev": call_ev,
+    }
 
 
 @app.function(
@@ -629,6 +1042,15 @@ def training_worker(
                 "checkpoint_path": train_result.get('checkpoint_path', ''),
                 "num_updates": train_result.get('num_updates', 0)
             }
+
+            # Occasionally run a small evaluation against simple baselines
+            if (iteration + 1) % 5 == 0 and train_result.get('checkpoint_path'):
+                try:
+                    eval_metrics = small_evaluation(iteration)
+                    if eval_metrics:
+                        metrics.update(eval_metrics)
+                except Exception as e:
+                    logger.warning(f"Small evaluation failed at iteration {iteration + 1}: {e}")
             
             # Validate metrics for NaN/Inf
             def is_valid_number(v):

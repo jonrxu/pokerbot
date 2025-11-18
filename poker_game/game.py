@@ -105,53 +105,72 @@ class PokerGame:
     
     def get_legal_actions(self, state: GameState) -> List[Tuple[Action, int]]:
         """Get legal actions for current player."""
+        # Terminal states have no legal actions
+        if state.is_terminal or state.current_player is None:
+            return []
+
         actions = []
         player = state.current_player
         to_call = state.current_bets[1 - player] - state.current_bets[player]
-        
+
         # Can always fold
         actions.append((Action.FOLD, 0))
-        
+
         # Can check/call
         if to_call == 0:
             actions.append((Action.CHECK, 0))
         else:
             if state.stacks[player] >= to_call:
                 actions.append((Action.CALL, to_call))
-        
+
         # Can bet/raise
         if to_call == 0:
-            # Betting
+            # Betting with a simplified, abstracted set of sizes:
+            # small bet (min_bet), pot bet, and all-in (subject to constraints).
             min_bet = state.big_blind if state.street == 0 else state.big_blind
             max_bet = min(state.stacks[player], state.max_raise)
             if state.is_limit:
                 max_bet = min(max_bet, state.big_blind * (2 if state.street < 2 else 4))
-            
+
             if min_bet <= max_bet and state.stacks[player] >= min_bet:
-                # Add common bet sizes
-                bet_sizes = [min_bet, min_bet * 2, min_bet * 3]
-                if not state.is_limit:
-                    bet_sizes.extend([int(state.stacks[player] * 0.5), int(state.stacks[player] * 0.75), state.stacks[player]])
-                for bet_size in bet_sizes:
-                    if min_bet <= bet_size <= max_bet:
+                bet_candidates = set()
+
+                # Small bet
+                bet_candidates.add(min_bet)
+
+                # Pot bet (at least min_bet)
+                pot_size = max(min_bet, state.pot)
+                bet_candidates.add(pot_size)
+
+                # All-in
+                bet_candidates.add(state.stacks[player])
+
+                for bet_size in sorted(bet_candidates):
+                    if min_bet <= bet_size <= max_bet and state.stacks[player] >= bet_size:
                         actions.append((Action.BET, bet_size))
         else:
-            # Raising
-            min_raise = state.current_bets[1 - player] + state.min_raise - state.current_bets[player]
-            max_raise = min(state.stacks[player], state.max_raise)
-            if state.is_limit:
-                max_raise = min(max_raise, state.big_blind * (2 if state.street < 2 else 4))
-            
-            if min_raise <= max_raise and state.stacks[player] >= min_raise:
-                # Add common raise sizes
-                raise_sizes = [min_raise, min_raise + state.min_raise]
-                if not state.is_limit:
-                    pot_raise = int(state.pot * 0.5)
-                    raise_sizes.extend([pot_raise, int(state.stacks[player] * 0.5), state.stacks[player]])
-                for raise_size in raise_sizes:
-                    if min_raise <= raise_size <= max_raise:
-                        actions.append((Action.RAISE, raise_size))
-        
+            # Raising with a simplified set of sizes:
+            # minimum raise and all-in (subject to constraints).
+            # Here, 'min_total' is the minimum total amount this player must have in the pot.
+            min_total = state.current_bets[1 - player] + state.min_raise
+            max_additional = min(state.stacks[player], state.max_raise)
+            min_additional = min_total - state.current_bets[player]
+
+            if min_additional <= max_additional and state.stacks[player] >= min_additional:
+                raise_totals = set()
+
+                # Minimum raise total
+                raise_totals.add(min_total)
+
+                # All-in total: current contributed chips + remaining stack
+                all_in_total = state.current_bets[player] + state.stacks[player]
+                raise_totals.add(all_in_total)
+
+                for total in sorted(raise_totals):
+                    additional = total - state.current_bets[player]
+                    if additional >= min_additional and additional <= max_additional and state.stacks[player] >= additional:
+                        actions.append((Action.RAISE, total))
+
         return actions
     
     def apply_action(self, state: GameState, action: Action, amount: int = 0) -> GameState:
@@ -316,42 +335,42 @@ class PokerGame:
         return (best_rank, best_tiebreaker)
     
     def get_payoff(self, state: GameState) -> List[float]:
-        """Get final payoffs for each player."""
+        """Get final payoffs for each player (net profit)."""
         if not state.is_terminal:
             return [0.0, 0.0]
         
         starting_stack = self.starting_stack
         
-        if state.winner is not None:
-            # Someone folded
-            payoffs = [0.0, 0.0]
-            payoffs[state.winner] = state.pot
-            # Return net profit
-            payoffs[0] -= (starting_stack - state.stacks[0])
-            payoffs[1] -= (starting_stack - state.stacks[1])
-            return payoffs
+        # Calculate payoffs accounting for pot distribution
+        # When someone folds, the pot goes to the winner
+        # When there's a showdown, the pot is split based on hand strength
+        payoffs = [0.0, 0.0]
         
-        if state.showdown:
-            # Evaluate hands
+        if state.winner is not None:
+            # Someone folded - winner gets the pot
+            payoffs[state.winner] = state.pot
+        
+        elif state.showdown:
+            # Showdown - evaluate hands
             hand0 = self.evaluate_hand(state.hole_cards[0], state.community_cards)
             hand1 = self.evaluate_hand(state.hole_cards[1], state.community_cards)
             
             if hand0 > hand1:
-                winner = 0
+                payoffs[0] = state.pot
             elif hand1 > hand0:
-                winner = 1
+                payoffs[1] = state.pot
             else:
                 # Split pot
-                payoffs = [state.pot / 2, state.pot / 2]
-                payoffs[0] -= (starting_stack - state.stacks[0])
-                payoffs[1] -= (starting_stack - state.stacks[1])
-                return payoffs
-            
-            payoffs = [0.0, 0.0]
-            payoffs[winner] = state.pot
-            payoffs[0] -= (starting_stack - state.stacks[0])
-            payoffs[1] -= (starting_stack - state.stacks[1])
-            return payoffs
+                payoffs[0] = state.pot / 2
+                payoffs[1] = state.pot / 2
         
-        return [0.0, 0.0]
+        # Convert to net profit (accounting for chips invested)
+        # Stacks already reflect chips invested, so we need to add the pot winnings
+        # and subtract starting stack
+        net_payoffs = [
+            state.stacks[0] + payoffs[0] - starting_stack,
+            state.stacks[1] + payoffs[1] - starting_stack
+        ]
+        
+        return net_payoffs
 

@@ -6,9 +6,9 @@ set -e
 # Default values
 ITERATIONS=${1:-1000}
 TRAJECTORIES=${2:-10000}
-WORKERS=${3:-4}
+WORKERS=${3:-16}  # Increased to 16 for faster parallel trajectory generation
 RESUME_FROM=${4:-}
-BATCH_SIZE=${5:-32}
+BATCH_SIZE=${5:-128}  # Increased to 128 for better GPU utilization with A10G
 
 echo "=========================================="
 echo "Poker Bot Training - Phase 1: Nash Equilibrium"

@@ -46,8 +46,9 @@ image = (
 checkpoint_volume = modal.Volume.from_name("poker-bot-checkpoints", create_if_missing=True)
 
 # GPU configuration
+# Options: "T4" (cheaper, slower), "A10G" (2x faster), "A100" (4x faster, most expensive)
 GPU_CONFIG = {
-    "gpu": "T4",  # Use T4 GPU for training
+    "gpu": "A10G",  # Upgraded to A10G for 2x faster training
     "memory": 16384,  # 16GB RAM
 }
 
@@ -59,7 +60,7 @@ CPU_CONFIG = {
 # Training configuration
 TRAINING_CONFIG = {
     "trajectories_per_worker": 1000,
-    "batch_size": 32,
+    "batch_size": 64,  # Increased from 32 for faster GPU training
     "network_update_frequency": 10,
     "checkpoint_frequency": 100,
 }

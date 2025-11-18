@@ -4,6 +4,7 @@ import random
 import numpy as np
 from typing import List, Tuple, Dict
 from collections import defaultdict
+from copy import deepcopy
 
 from poker_game.game import PokerGame, GameState, Action
 from poker_game.information_set import InformationSet, get_information_set
@@ -58,12 +59,24 @@ class SelfPlayGenerator:
             action, amount = legal_actions[action_idx]
             
             # Store trajectory data
-            trajectory['states'].append(state)
+            # CRITICAL: Deep copy state to prevent mutation issues during backward pass
+            # The state contains mutable lists (hole_cards, betting_history, etc.)
+            # that could be modified if we store references
+            trajectory['states'].append(deepcopy(state))
             trajectory['actions'].append((action_idx, action, amount))
             trajectory['info_sets'].append(info_set)
             
             # Apply action
             state = self.game.apply_action(state, action, amount)
+        
+        # CRITICAL FIX: Append terminal state to trajectory
+        # The loop exits when state becomes terminal, but we need to store it
+        if state.is_terminal:
+            # Deep copy terminal state as well
+            trajectory['states'].append(deepcopy(state))
+            # Add a placeholder info_set for terminal state (won't be used)
+            terminal_info_set = get_information_set(state, current_player)
+            trajectory['info_sets'].append(terminal_info_set)
         
         # Get final payoffs
         payoffs = self.game.get_payoff(state)

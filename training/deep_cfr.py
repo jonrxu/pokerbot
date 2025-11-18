@@ -22,6 +22,7 @@ class DeepCFR:
                  state_encoder: StateEncoder,
                  game: PokerGame,
                  learning_rate: float = 1e-4,
+                 value_learning_rate: float = None,  # Separate LR for value network
                  device: str = 'cpu'):
         self.value_net = value_net
         self.policy_net = policy_net
@@ -29,12 +30,17 @@ class DeepCFR:
         self.game = game
         self.device = device
         
+        # Value clipping parameters (prevent unbounded growth)
+        self.value_clip_min = -10000.0
+        self.value_clip_max = 10000.0
+        
         # Move networks to device
         self.value_net.to(device)
         self.policy_net.to(device)
         
-        # Optimizers
-        self.value_optimizer = optim.Adam(self.value_net.parameters(), lr=learning_rate)
+        # Use separate learning rates: lower for value network to prevent instability
+        value_lr = value_learning_rate if value_learning_rate is not None else learning_rate * 0.5
+        self.value_optimizer = optim.Adam(self.value_net.parameters(), lr=value_lr)
         self.policy_optimizer = optim.Adam(self.policy_net.parameters(), lr=learning_rate)
         
         # Regret and strategy accumulators
@@ -48,6 +54,11 @@ class DeepCFR:
         
         # Exploration parameter
         self.exploration = 0.6
+    
+    def get_counterfactual_value(self, key: str, default: float = 0.0) -> float:
+        """Get counterfactual value with clipping to prevent unbounded values."""
+        value = self.counterfactual_values.get(key, default)
+        return np.clip(value, self.value_clip_min, self.value_clip_max)
     
     def regret_matching(self, regrets: Dict[int, float]) -> Dict[int, float]:
         """Convert regrets to action probabilities using regret matching."""
@@ -72,8 +83,19 @@ class DeepCFR:
         if not regrets or len(regrets) != len(legal_actions):
             return {i: 1.0 / len(legal_actions) for i in range(len(legal_actions))}
         
-        # Regret matching
-        return self.regret_matching(regrets)
+        # Filter regrets to only include valid indices (0 to len(legal_actions)-1)
+        # This handles cases where regret_memory has stale indices from different states
+        # that share the same information set but have different legal actions
+        max_valid_idx = len(legal_actions) - 1
+        valid_regrets = {idx: regret for idx, regret in regrets.items() 
+                        if 0 <= idx <= max_valid_idx}
+        
+        # If no valid regrets, return uniform
+        if not valid_regrets:
+            return {i: 1.0 / len(legal_actions) for i in range(len(legal_actions))}
+        
+        # Regret matching on valid regrets only
+        return self.regret_matching(valid_regrets)
     
     def sample_action(self, strategy: Dict[int, float]) -> int:
         """Sample an action from strategy distribution."""
@@ -153,10 +175,11 @@ class DeepCFR:
             regret = cf_value - node_value
             self.regret_memory[key][action_idx] += regret * reach_prob
         
-        # Update counterfactual value
-        self.counterfactual_values[key] = node_value
+        # Update counterfactual value with clipping to prevent unbounded growth
+        clipped_node_value = np.clip(node_value, self.value_clip_min, self.value_clip_max)
+        self.counterfactual_values[key] = clipped_node_value
         
-        return node_value, trajectory_data
+        return clipped_node_value, trajectory_data
     
     def update_networks(self, batch_size: int = 32):
         """Update value and policy networks from buffers."""

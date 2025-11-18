@@ -28,13 +28,51 @@ def plot_metrics(output_file='training_metrics.png', show_plot=False):
             print('No full-scale iterations found yet')
             return
         
-        iterations = [m.get('iteration', 0) for m in full_scale]
-        value_losses = [m.get('value_loss', 0) for m in full_scale]
-        policy_losses = [m.get('policy_loss', 0) for m in full_scale]
+        # Use only the latest entry per iteration to avoid duplicates
+        latest_per_iter = {}
+        for m in full_scale:
+            it = m.get('iteration', 0)
+            if it not in latest_per_iter or m.get('timestamp', '') > latest_per_iter[it].get('timestamp', ''):
+                latest_per_iter[it] = m
+        
+        # Extract metrics from unique iterations
+        sorted_iters = sorted(latest_per_iter.keys())
+        
+        # Filter to only show latest run (iterations 1-19, since metrics are 1-indexed)
+        # Metrics are stored with iteration + 1, so iteration 0 in code = iteration 1 in metrics
+        # Find the start of the latest run by looking for iteration 1
+        if 1 in sorted_iters:
+            # Latest run starts at iteration 1, show first 19 iterations (1-19)
+            latest_run_iters = [it for it in sorted_iters if 1 <= it <= 19]
+        else:
+            # If no iteration 1, take the latest 19 iterations
+            latest_run_iters = sorted_iters[-19:] if len(sorted_iters) >= 19 else sorted_iters
+        
+        # Filter out iterations with invalid metrics (0 or missing values)
+        valid_iters = []
+        valid_value_losses = []
+        valid_policy_losses = []
+        
+        for it in latest_run_iters:
+            value_loss = latest_per_iter[it].get('value_loss', 0)
+            policy_loss = latest_per_iter[it].get('policy_loss', 0)
+            # Only include iterations with valid (non-zero) metrics
+            if value_loss > 0 and policy_loss > 0:
+                valid_iters.append(it)
+                valid_value_losses.append(value_loss)
+                valid_policy_losses.append(policy_loss)
+        
+        if len(valid_iters) == 0:
+            print('No valid metrics found for latest run')
+            return
+        
+        iterations = valid_iters
+        value_losses = valid_value_losses
+        policy_losses = valid_policy_losses
         
         # Create figure with two subplots
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10))
-        fig.suptitle('Training Progress: Deep CFR Poker Bot', fontsize=16, fontweight='bold')
+        fig.suptitle('Training Progress: Deep CFR Poker Bot (Latest Run)', fontsize=16, fontweight='bold')
         
         # Plot Policy Loss (more important metric)
         ax1.plot(iterations, policy_losses, 'b-o', linewidth=2.5, markersize=5, 
@@ -90,7 +128,7 @@ def plot_metrics(output_file='training_metrics.png', show_plot=False):
                 bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.7))
         
         # Add overall stats at bottom
-        stats_text = f'Total Iterations: {len(full_scale)} | Iterations {iterations[0]}-{iterations[-1]}'
+        stats_text = f'Unique Iterations: {len(iterations)} | Range: {iterations[0]}-{iterations[-1]}'
         fig.text(0.5, 0.01, stats_text, ha='center', fontsize=10, style='italic')
         
         plt.tight_layout()
@@ -101,7 +139,7 @@ def plot_metrics(output_file='training_metrics.png', show_plot=False):
         print(f'✓ Graph saved to: {output_file}')
         print(f'  Policy Loss: {policy_losses[0]:.4f} → {policy_losses[-1]:.4f} ({improvement:.1f}% improvement)')
         print(f'  Value Loss: {value_losses[0]:.2f} → {value_losses[-1]:.2f}')
-        print(f'  Total iterations plotted: {len(full_scale)}')
+        print(f'  Unique iterations plotted: {len(iterations)}')
         
         if show_plot:
             plt.show()
