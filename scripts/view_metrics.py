@@ -5,13 +5,19 @@ import json
 import sys
 from pathlib import Path
 
-def load_metrics(metrics_dir: str = "./local_metrics"):
+def load_metrics(metrics_dir: str = None):
     """Load and display metrics."""
+    if metrics_dir is None:
+        print("Usage: python scripts/view_metrics.py <metrics_directory>")
+        print("Or download metrics first: modal volume download poker-bot-checkpoints /checkpoints/metrics <dir>")
+        return
+    
     metrics_file = Path(metrics_dir) / "training_metrics.jsonl"
     summary_file = Path(metrics_dir) / "summary.json"
     
     if not summary_file.exists():
-        print("No metrics found. Run: ./scripts/check_status.sh")
+        print(f"No metrics found in {metrics_dir}")
+        print("Download metrics first: modal volume download poker-bot-checkpoints /checkpoints/metrics <dir>")
         return
     
     # Load summary
@@ -53,6 +59,10 @@ def load_metrics(metrics_dir: str = "./local_metrics"):
                       f"Traj: {m.get('trajectories_generated', 0):5d}")
 
 if __name__ == "__main__":
-    metrics_dir = sys.argv[1] if len(sys.argv) > 1 else "./local_metrics"
+    if len(sys.argv) < 2:
+        print("Usage: python scripts/view_metrics.py <metrics_directory>")
+        print("Download metrics first: modal volume download poker-bot-checkpoints /checkpoints/metrics <dir>")
+        sys.exit(1)
+    metrics_dir = sys.argv[1]
     load_metrics(metrics_dir)
 

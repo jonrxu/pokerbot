@@ -6,11 +6,26 @@ import matplotlib.pyplot as plt
 import numpy as np
 import sys
 from pathlib import Path
+from datetime import datetime
 from modal_deploy.check_results import app, check_training_results
 
 
-def plot_metrics(output_file='training_metrics.png', show_plot=False):
+def plot_metrics(output_file=None, show_plot=False):
     """Fetch metrics from Modal and create visualization."""
+    
+    # Default to metrics/ folder with timestamp
+    if output_file is None:
+        metrics_dir = Path('metrics')
+        metrics_dir.mkdir(exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_file = metrics_dir / f'training_metrics_{timestamp}.png'
+    else:
+        output_file = Path(output_file)
+        # If no directory specified, save to metrics/ folder
+        if output_file.parent == Path('.'):
+            metrics_dir = Path('metrics')
+            metrics_dir.mkdir(exist_ok=True)
+            output_file = metrics_dir / output_file.name
     
     with app.run():
         result = check_training_results.remote()
@@ -21,16 +36,17 @@ def plot_metrics(output_file='training_metrics.png', show_plot=False):
         
         metrics = result['all_entries']
         
-        # Filter to full-scale iterations (10k trajectories)
-        full_scale = [m for m in metrics if m.get('trajectories_generated', 0) >= 10000]
+        # Filter to current training run (2000 trajectories per iteration)
+        # Accept any iterations with trajectories >= 1000 (to include our 2000 traj/iter runs)
+        current_run = [m for m in metrics if m.get('trajectories_generated', 0) >= 1000]
         
-        if len(full_scale) == 0:
-            print('No full-scale iterations found yet')
+        if len(current_run) == 0:
+            print('No training iterations found yet')
             return
         
         # Use only the latest entry per iteration to avoid duplicates
         latest_per_iter = {}
-        for m in full_scale:
+        for m in current_run:
             it = m.get('iteration', 0)
             if it not in latest_per_iter or m.get('timestamp', '') > latest_per_iter[it].get('timestamp', ''):
                 latest_per_iter[it] = m
@@ -134,21 +150,73 @@ def plot_metrics(output_file='training_metrics.png', show_plot=False):
         plt.tight_layout()
         plt.subplots_adjust(bottom=0.05)
         
+        # Check for evaluation metrics
+        eval_random_wr = []
+        eval_call_wr = []
+        eval_iterations = []
+        
+        for it in latest_run_iters:
+            m = latest_per_iter[it]
+            if 'eval_random_win_rate' in m:
+                eval_iterations.append(it)
+                eval_random_wr.append(m.get('eval_random_win_rate', 0))
+                eval_call_wr.append(m.get('eval_always_call_win_rate', 0))
+        
+        # Add evaluation subplot if available
+        if len(eval_iterations) > 0:
+            ax3 = fig.add_subplot(3, 1, 3)
+            ax3.plot(eval_iterations, [w * 100 for w in eval_random_wr], 'r-o', 
+                    linewidth=2.5, markersize=5, label='vs Random', alpha=0.8)
+            ax3.plot(eval_iterations, [w * 100 for w in eval_call_wr], 'm-s', 
+                    linewidth=2.5, markersize=5, label='vs Always Call', alpha=0.8)
+            ax3.axhline(y=50, color='k', linestyle='--', alpha=0.3, label='Break-even')
+            ax3.set_xlabel('Iteration', fontsize=12, fontweight='bold')
+            ax3.set_ylabel('Win Rate (%)', fontsize=12, fontweight='bold')
+            ax3.set_title('Evaluation: Win Rate vs Baselines', fontsize=14, fontweight='bold')
+            ax3.grid(True, alpha=0.3, linestyle='--')
+            ax3.legend(loc='best', fontsize=10)
+            ax3.set_ylim([0, 100])
+            
+            if len(eval_random_wr) > 0:
+                eval_info = f'Latest vs Random: {eval_random_wr[-1]*100:.1f}%\nLatest vs Always Call: {eval_call_wr[-1]*100:.1f}%'
+                ax3.text(0.02, 0.98, eval_info, 
+                        transform=ax3.transAxes, fontsize=10,
+                        verticalalignment='top', 
+                        bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.7))
+            
+            fig.suptitle('Training Progress: Deep CFR Poker Bot (Replay Buffer + Feature Encoder)', 
+                        fontsize=16, fontweight='bold')
+            plt.subplots_adjust(hspace=0.4, bottom=0.05)
+        else:
+            fig.suptitle('Training Progress: Deep CFR Poker Bot (Replay Buffer + Feature Encoder)', 
+                        fontsize=16, fontweight='bold')
+            plt.subplots_adjust(bottom=0.05)
+        
         # Save figure
-        plt.savefig(output_file, dpi=150, bbox_inches='tight')
-        print(f'✓ Graph saved to: {output_file}')
-        print(f'  Policy Loss: {policy_losses[0]:.4f} → {policy_losses[-1]:.4f} ({improvement:.1f}% improvement)')
+        output_file_str = str(output_file)
+        plt.savefig(output_file_str, dpi=150, bbox_inches='tight')
+        print(f'✓ Graph saved to: {output_file_str}')
+        print(f'  Policy Loss: {policy_losses[0]:.4f} → {policy_losses[-1]:.4f} ({improvement:.1f}% change)')
         print(f'  Value Loss: {value_losses[0]:.2f} → {value_losses[-1]:.2f}')
         print(f'  Unique iterations plotted: {len(iterations)}')
+        
+        if len(eval_iterations) > 0:
+            print(f'\n  Evaluation Results:')
+            print(f'    vs Random: {eval_random_wr[-1]*100:.1f}% win rate (iter {eval_iterations[-1]})')
+            print(f'    vs Always Call: {eval_call_wr[-1]*100:.1f}% win rate (iter {eval_iterations[-1]})')
         
         if show_plot:
             plt.show()
         else:
             plt.close()
+        
+        return output_file_str
 
 
 if __name__ == '__main__':
-    output_file = sys.argv[1] if len(sys.argv) > 1 else 'training_metrics.png'
+    output_file = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith('--') else None
     show = '--show' in sys.argv
-    plot_metrics(output_file, show_plot=show)
+    result_file = plot_metrics(output_file, show_plot=show)
+    if result_file:
+        print(f"\n✓ Metrics graph saved to: {result_file}")
 

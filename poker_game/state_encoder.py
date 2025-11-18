@@ -5,6 +5,13 @@ import torch
 from typing import List, Tuple
 from .game import GameState, Action
 
+# Try to import treys for hand evaluation
+try:
+    from treys import Card, Evaluator
+    HAS_TREYS = True
+except ImportError:
+    HAS_TREYS = False
+
 
 class StateEncoder:
     """Encodes poker game state into neural network input tensor."""
@@ -15,6 +22,8 @@ class StateEncoder:
     
     def __init__(self):
         self.feature_dim = self._calculate_feature_dim()
+        if HAS_TREYS:
+            self.evaluator = Evaluator()
     
     def _calculate_feature_dim(self) -> int:
         """Calculate total feature dimension."""
@@ -25,8 +34,21 @@ class StateEncoder:
         # Position: 1
         # Street: 1
         # Current bets: 2
-        return 34 + 85 + (self.MAX_HISTORY * 2) + 4 + 1 + 1 + 2
+        # Hand Strength features:
+        # - Strength (normalized rank): 1
+        # - Hand Class (one-hot): 10
+        return 34 + 85 + (self.MAX_HISTORY * 2) + 4 + 1 + 1 + 2 + 1 + 10
     
+    def _get_treys_card(self, rank: int, suit: int):
+        """Convert internal card representation to treys Card."""
+        if not HAS_TREYS:
+            return 0
+        # rank 0..12 -> '2'..'A'
+        # suit 0..3 -> 's','h','d','c'
+        r_char = '23456789TJQKA'[rank]
+        s_char = 'shdc'[suit]
+        return Card.new(f"{r_char}{s_char}")
+
     def encode(self, state: GameState, player: int) -> np.ndarray:
         """Encode game state for a specific player."""
         features = []
@@ -99,6 +121,53 @@ class StateEncoder:
         bet_self = state.current_bets[player] / state.big_blind if state.big_blind > 0 else 0.0
         bet_opp = state.current_bets[1 - player] / state.big_blind if state.big_blind > 0 else 0.0
         features.extend([bet_self, bet_opp])
+
+        # --- Explicit Hand Features (The "Sight" Fix) ---
+        hand_strength = 0.0
+        hand_class_onehot = np.zeros(10)
+        
+        if HAS_TREYS:
+            try:
+                hole = [self._get_treys_card(r, s) for r, s in hole_cards]
+                board = [self._get_treys_card(r, s) for r, s in state.community_cards]
+                
+                if len(board) >= 3:
+                    # Post-flop: Use full evaluation
+                    rank = self.evaluator.evaluate(board, hole)
+                    # rank is 1 (best) to 7462 (worst)
+                    # Normalize to 0.0 - 1.0 (1.0 is best)
+                    hand_strength = 1.0 - (rank / 7462.0)
+                    
+                    rank_class = self.evaluator.get_rank_class(rank)
+                    # treys returns 1 (Royal Flush) to 9 (High Card)
+                    # We map 1->9 (index 9), 9->1 (index 1), or just use index = 10 - rank_class
+                    # Let's just use 0-based index: index = rank_class - 1
+                    if 1 <= rank_class <= 10:
+                         hand_class_onehot[rank_class - 1] = 1.0
+                         
+                else:
+                    # Pre-flop: Heuristics
+                    r1, s1 = hole_cards[0]
+                    r2, s2 = hole_cards[1]
+                    
+                    # Pair
+                    if r1 == r2:
+                        hand_strength = 0.5 + (r1 / 26.0) # 0.5 to 1.0 approx
+                        hand_class_onehot[8] = 1.0 # Treat as "Pair" class (index 8 for Pair in standard list usually)
+                    else:
+                        high_card = max(r1, r2)
+                        hand_strength = high_card / 26.0 # 0.0 to 0.5 approx
+                        hand_class_onehot[9] = 1.0 # High Card
+                        
+                        # Suited bonus
+                        if s1 == s2:
+                            hand_strength += 0.05
+            except Exception:
+                # Fallback if evaluation fails
+                pass
+        
+        features.append(hand_strength)
+        features.extend(hand_class_onehot)
         
         return np.array(features, dtype=np.float32)
     
@@ -106,4 +175,3 @@ class StateEncoder:
         """Encode a batch of states."""
         encoded = [self.encode(state, player) for state, player in states]
         return torch.tensor(np.stack(encoded), dtype=torch.float32)
-

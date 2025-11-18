@@ -31,7 +31,7 @@ conda activate poker_bot
 # Start async training job
 echo "Submitting job to Modal..."
 if [ -n "$RESUME_FROM" ]; then
-    modal run modal_train.py::app.main \
+    modal run modal_deploy/train.py::app.main \
         --num-iterations $ITERATIONS \
         --trajectories-per-iteration $TRAJECTORIES \
         --num-workers $WORKERS \
@@ -39,7 +39,7 @@ if [ -n "$RESUME_FROM" ]; then
         --resume-from $RESUME_FROM \
         --deploy
 else
-    modal run modal_train.py::app.main \
+    modal run modal_deploy/train.py::app.main \
         --num-iterations $ITERATIONS \
         --trajectories-per-iteration $TRAJECTORIES \
         --num-workers $WORKERS \
@@ -53,6 +53,6 @@ echo ""
 echo "To monitor progress:"
 echo "  1. Check Modal dashboard: https://modal.com/apps"
 echo "  2. View logs: modal app logs poker-bot-training"
-echo "  3. Download metrics: modal volume download poker-bot-checkpoints /checkpoints/metrics ./local_metrics"
+echo "  3. Plot metrics: python scripts/plot_metrics.py"
 echo ""
 

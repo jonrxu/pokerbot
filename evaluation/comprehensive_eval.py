@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
-"""Evaluate current bot against baseline opponents and early iterations."""
+"""Comprehensive evaluation of iteration 50 against iter 195 and baselines."""
 
 import sys
 import os
-import torch
-import numpy as np
-import random
 from pathlib import Path
 
 # Add project root to path
@@ -14,45 +11,21 @@ sys.path.insert(0, str(project_root))
 
 from modal_deploy.config import checkpoint_volume, image
 import modal
-from poker_game.game import PokerGame, GameState, Action
-from poker_game.state_encoder import StateEncoder
-from models.value_policy_net import ValuePolicyNet
+
+# Create a single evaluation app
+eval_app = modal.App("poker-bot-comprehensive-eval")
 
 
-# Create Modal app for evaluation
-eval_app = modal.App("poker-bot-benchmark-eval")
-
-
-class RandomAgent:
-    """Random baseline agent - plays completely randomly."""
-    
-    def get_action(self, state: GameState, legal_actions):
-        """Return random legal action."""
-        if len(legal_actions) == 0:
-            return (Action.FOLD, 0)
-        return random.choice(legal_actions)
-
-
-class AlwaysCallAgent:
-    """Always calls/checks - very weak baseline."""
-    
-    def get_action(self, state: GameState, legal_actions):
-        """Always call or check."""
-        to_call = state.current_bets[1 - state.current_player] - state.current_bets[state.current_player]
-        
-        if to_call == 0:
-            # Check if possible
-            for action, amount in legal_actions:
-                if action == Action.CHECK:
-                    return (action, amount)
-        else:
-            # Call if possible
-            for action, amount in legal_actions:
-                if action == Action.CALL:
-                    return (action, amount)
-        
-        # Fallback: fold
-        return (Action.FOLD, 0)
+@eval_app.function(
+    image=image,
+    volumes={"/checkpoints": checkpoint_volume},
+    cpu=4,
+    memory=8192,
+    timeout=3600,
+)
+def check_checkpoint_exists(checkpoint_name: str) -> bool:
+    """Check if a checkpoint exists on Modal."""
+    return os.path.exists(f"/checkpoints/{checkpoint_name}")
 
 
 @eval_app.function(
@@ -70,32 +43,45 @@ def evaluate_against_baseline_modal(
     """Evaluate current bot against a baseline opponent."""
     import os
     import torch
+    import numpy as np
     import random
     from poker_game.game import PokerGame, GameState, Action
     from poker_game.state_encoder import StateEncoder
     from models.value_policy_net import ValuePolicyNet
     
-    # Define BaselineAgent inline since bootstrap module may not be available
+    # Define baseline agents inline
+    class RandomAgent:
+        def get_action(self, state: GameState, legal_actions):
+            if len(legal_actions) == 0:
+                return (Action.FOLD, 0)
+            return random.choice(legal_actions)
+    
+    class AlwaysCallAgent:
+        def get_action(self, state: GameState, legal_actions):
+            to_call = state.current_bets[1 - state.current_player] - state.current_bets[state.current_player]
+            if to_call == 0:
+                for action, amount in legal_actions:
+                    if action == Action.CHECK:
+                        return (action, amount)
+            else:
+                for action, amount in legal_actions:
+                    if action == Action.CALL:
+                        return (action, amount)
+            return (Action.FOLD, 0)
+    
     class BaselineAgent:
-        """Simple baseline agent for warm-start training."""
-        
         def __init__(self, game: PokerGame):
             self.game = game
         
         def get_action(self, state: GameState, legal_actions):
-            """Get action using simple heuristic strategy."""
             if len(legal_actions) == 0:
                 return (Action.FOLD, 0)
-            
             player = state.current_player
             hole_cards = state.hole_cards[player]
-            
-            # Simple tight-aggressive strategy
             hand_strength = self._evaluate_hand_strength(hole_cards, state.community_cards)
             to_call = state.current_bets[1 - player] - state.current_bets[player]
             
             if hand_strength > 0.7:
-                # Strong hand - bet/raise
                 if to_call == 0:
                     bet_actions = [a for a in legal_actions if a[0] in [Action.BET, Action.RAISE]]
                     if bet_actions:
@@ -108,7 +94,6 @@ def evaluate_against_baseline_modal(
                     if call_actions:
                         return call_actions[0]
             elif hand_strength > 0.4:
-                # Medium hand - call/check
                 if to_call == 0:
                     check_actions = [a for a in legal_actions if a[0] == Action.CHECK]
                     if check_actions:
@@ -120,18 +105,14 @@ def evaluate_against_baseline_modal(
                     else:
                         return (Action.FOLD, 0)
             else:
-                # Weak hand - fold or check
                 if to_call == 0:
                     check_actions = [a for a in legal_actions if a[0] == Action.CHECK]
                     if check_actions:
                         return check_actions[0]
                 return (Action.FOLD, 0)
-            
-            # Fallback: first legal action
             return legal_actions[0]
         
         def _evaluate_hand_strength(self, hole_cards, community_cards):
-            """Evaluate hand strength (0-1)."""
             ranks = [card[0] for card in hole_cards]
             if ranks[0] == ranks[1]:
                 return 0.6 + min(ranks[0], 12) / 12.0 * 0.3
@@ -150,19 +131,15 @@ def evaluate_against_baseline_modal(
     state_encoder = StateEncoder()
     
     def load_network(checkpoint_path):
-        """Load network from checkpoint."""
         if not os.path.exists(checkpoint_path):
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-        
         checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         input_dim = state_encoder.feature_dim
         policy_net = ValuePolicyNet(input_dim=input_dim)
-        
         if 'policy_net_state' in checkpoint:
             policy_net.load_state_dict(checkpoint['policy_net_state'])
         else:
             raise ValueError(f"Checkpoint missing policy_net_state: {checkpoint_path}")
-        
         return policy_net
     
     # Load current bot
@@ -182,7 +159,6 @@ def evaluate_against_baseline_modal(
         baseline_agent = BaselineAgent(game)
         use_network = False
     else:
-        # It's an iteration number
         baseline_checkpoint = f"/checkpoints/checkpoint_iter_{baseline_type}.pt"
         baseline_net = load_network(baseline_checkpoint)
         baseline_net.eval()
@@ -196,7 +172,6 @@ def evaluate_against_baseline_modal(
     for game_num in range(num_games):
         state = game.reset()
         
-        # Randomly assign positions
         if random.random() < 0.5:
             current_is_player0 = True
         else:
@@ -209,9 +184,7 @@ def evaluate_against_baseline_modal(
             if len(legal_actions) == 0:
                 break
             
-            # Get action
             if (player == 0 and current_is_player0) or (player == 1 and not current_is_player0):
-                # Current bot's turn
                 state_encoding = state_encoder.encode(state, player)
                 state_tensor = torch.tensor(state_encoding, dtype=torch.float32).unsqueeze(0)
                 
@@ -219,26 +192,19 @@ def evaluate_against_baseline_modal(
                     _, policy_logits = current_net(state_tensor)
                     action_probs = torch.softmax(policy_logits, dim=1).cpu().numpy()[0]
                 
-                # Sample action - map network output to legal actions
-                # The network outputs probabilities for action indices 0..max_actions-1
-                # Action index i corresponds to the i-th legal action
-                # Mask out actions beyond the number of legal actions
                 num_legal = len(legal_actions)
                 if num_legal == 0:
                     break
                 
-                # Only use probabilities for the first num_legal actions
                 legal_probs = action_probs[:num_legal]
                 if legal_probs.sum() > 0:
                     legal_probs = legal_probs / legal_probs.sum()
                 else:
-                    # Uniform if all probabilities are zero
                     legal_probs = np.ones(num_legal) / num_legal
                 
                 action_idx = np.random.choice(num_legal, p=legal_probs)
                 action, amount = legal_actions[action_idx]
             else:
-                # Baseline opponent's turn
                 if use_network:
                     state_encoding = state_encoder.encode(state, player)
                     state_tensor = torch.tensor(state_encoding, dtype=torch.float32).unsqueeze(0)
@@ -247,7 +213,6 @@ def evaluate_against_baseline_modal(
                         _, policy_logits = baseline_net(state_tensor)
                         action_probs = torch.softmax(policy_logits, dim=1).cpu().numpy()[0]
                     
-                    # Same logic as above
                     num_legal = len(legal_actions)
                     if num_legal == 0:
                         break
@@ -265,7 +230,6 @@ def evaluate_against_baseline_modal(
             
             state = game.apply_action(state, action, amount)
         
-        # Get payoffs
         payoffs = game.get_payoff(state)
         
         if current_is_player0:
@@ -292,40 +256,130 @@ def evaluate_against_baseline_modal(
     }
 
 
+@eval_app.function(
+    image=image,
+    volumes={"/checkpoints": checkpoint_volume},
+    cpu=4,
+    memory=8192,
+    timeout=3600,
+)
+def evaluate_checkpoints_modal(
+    iteration1: int,
+    iteration2: int,
+    num_games: int = 1000
+):
+    """Evaluate two checkpoints against each other."""
+    import os
+    import torch
+    import numpy as np
+    from poker_game.game import PokerGame
+    from poker_game.state_encoder import StateEncoder
+    from models.value_policy_net import ValuePolicyNet
+    from evaluation.evaluator import Evaluator
+    
+    print(f"Evaluating iteration {iteration1} vs iteration {iteration2}")
+    print(f"Games: {num_games}")
+    
+    game = PokerGame(small_blind=50, big_blind=100, is_limit=False)
+    state_encoder = StateEncoder()
+    evaluator = Evaluator(game, state_encoder)
+    
+    def load_network(checkpoint_path):
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+        input_dim = state_encoder.feature_dim
+        policy_net = ValuePolicyNet(input_dim=input_dim)
+        if 'policy_net_state' in checkpoint:
+            policy_net.load_state_dict(checkpoint['policy_net_state'])
+        else:
+            raise ValueError(f"Checkpoint missing policy_net_state: {checkpoint_path}")
+        return policy_net
+    
+    checkpoint1_path = f"/checkpoints/checkpoint_iter_{iteration1}.pt"
+    checkpoint2_path = f"/checkpoints/checkpoint_iter_{iteration2}.pt"
+    
+    print(f"Loading checkpoint 1: {checkpoint1_path}")
+    network1 = load_network(checkpoint1_path)
+    
+    print(f"Loading checkpoint 2: {checkpoint2_path}")
+    network2 = load_network(checkpoint2_path)
+    
+    print("Running evaluation...")
+    result = evaluator.evaluate_agents(
+        network1, network2, num_games=num_games, device='cpu'
+    )
+    
+    return {
+        'iteration1': iteration1,
+        'iteration2': iteration2,
+        'num_games': num_games,
+        'iteration1_win_rate': result['agent1_win_rate'],
+        'iteration2_win_rate': result['agent2_win_rate'],
+        'iteration1_avg_payoff': result['agent1_payoff'],
+        'iteration2_avg_payoff': result['agent2_payoff'],
+        'full_result': result
+    }
+
+
 def main():
-    """Run benchmark evaluations."""
+    """Run comprehensive evaluation."""
     import argparse
-    parser = argparse.ArgumentParser(description='Evaluate against benchmarks')
-    parser.add_argument('--current', type=int, default=195,
-                       help='Current iteration (default: 195)')
+    parser = argparse.ArgumentParser(description='Comprehensive evaluation')
+    parser.add_argument('--current', type=int, default=50,
+                       help='Current iteration (default: 50)')
+    parser.add_argument('--old', type=int, default=195,
+                       help='Old iteration to compare (default: 195)')
     parser.add_argument('--num-games', type=int, default=2000,
                        help='Number of games per matchup (default: 2000)')
     
     args = parser.parse_args()
     
     print("="*80)
-    print("BENCHMARK EVALUATION")
+    print("COMPREHENSIVE EVALUATION")
     print("="*80)
     print(f"Current iteration: {args.current}")
+    print(f"Old iteration: {args.old}")
     print(f"Games per matchup: {args.num_games}")
     print()
     
-    # Evaluate against different baselines
+    # Check if checkpoints exist
+    print("Checking checkpoint availability...")
+    with eval_app.run():
+        current_exists = check_checkpoint_exists.remote(f"checkpoint_iter_{args.current}.pt")
+        old_exists = check_checkpoint_exists.remote(f"checkpoint_iter_{args.old}.pt")
+    
+    if not current_exists:
+        print(f"✗ ERROR: checkpoint_iter_{args.current}.pt not found on Modal!")
+        return
+    if not old_exists:
+        print(f"⚠ WARNING: checkpoint_iter_{args.old}.pt not found on Modal!")
+        print("  Will skip comparison with old checkpoint.")
+        compare_old = False
+    else:
+        compare_old = True
+        print(f"✓ Found checkpoint_iter_{args.current}.pt")
+        print(f"✓ Found checkpoint_iter_{args.old}.pt")
+    
+    print()
+    
+    results = {}
+    
+    # PART 1: Evaluate against baselines
+    print("="*80)
+    print("PART 1: EVALUATION AGAINST BASELINES")
+    print("="*80)
+    print()
+    
     baselines = [
         ('random', 'Random Agent'),
         ('always_call', 'Always Call Agent'),
         ('baseline', 'Baseline Agent (TAG)'),
-        ('1', 'Iteration 1 (very early)'),
-        ('2', 'Iteration 2'),
-        ('5', 'Iteration 5'),
-        ('10', 'Iteration 10'),
     ]
-    
-    results = {}
     
     with eval_app.run():
         for baseline_key, baseline_name in baselines:
-            print(f"Evaluating vs {baseline_name}...")
+            print(f"Evaluating Iter {args.current} vs {baseline_name}...")
             print("-" * 80)
             
             try:
@@ -336,7 +390,7 @@ def main():
                 win_rate = result['win_rate']
                 avg_payoff = result['avg_payoff']
                 
-                results[baseline_name] = result
+                results[f"iter_{args.current}_vs_{baseline_key}"] = result
                 
                 print(f"  Win Rate: {win_rate:.2%}")
                 print(f"  Avg Payoff: {avg_payoff:.2f} chips/game")
@@ -363,36 +417,86 @@ def main():
                 traceback.print_exc()
                 print()
     
-    # Summary
+    # PART 2: Evaluate against old checkpoint
+    if compare_old:
+        print("="*80)
+        print("PART 2: EVALUATION AGAINST OLD CHECKPOINT")
+        print("="*80)
+        print()
+        
+        print(f"Evaluating Iter {args.current} vs Iter {args.old}...")
+        print("-" * 80)
+        
+        try:
+            with eval_app.run():
+                result = evaluate_checkpoints_modal.remote(
+                    args.current, args.old, args.num_games
+                )
+            
+            win_rate = result['iteration1_win_rate']
+            avg_payoff = result['iteration1_avg_payoff']
+            
+            results[f"iter_{args.current}_vs_{args.old}"] = result
+            
+            print(f"  Win Rate (Iter {args.current}): {win_rate:.2%}")
+            print(f"  Avg Payoff (Iter {args.current}): {avg_payoff:.2f} chips/game")
+            print(f"  Win Rate (Iter {args.old}): {result['iteration2_win_rate']:.2%}")
+            print(f"  Avg Payoff (Iter {args.old}): {result['iteration2_avg_payoff']:.2f} chips/game")
+            
+            # Assessment
+            if win_rate > 0.55:
+                print(f"  ✓ Current bot is significantly better (>55% win rate)")
+            elif win_rate > 0.50:
+                print(f"  ⚠ Current bot is slightly better (>50% win rate)")
+            elif win_rate < 0.45:
+                print(f"  ✗ Current bot is WORSE (<45% win rate) - concerning!")
+            else:
+                print(f"  ≈ Results are roughly even (45-55% win rate)")
+            
+            print()
+            
+        except Exception as e:
+            print(f"  ✗ Error: {e}")
+            import traceback
+            traceback.print_exc()
+            print()
+    
+    # SUMMARY
     print("="*80)
     print("SUMMARY")
     print("="*80)
-    print(f"{'Opponent':<30} {'Win Rate':<15} {'Avg Payoff':<15}")
+    print(f"{'Matchup':<40} {'Win Rate':<15} {'Avg Payoff':<15}")
     print("-" * 80)
     
-    for name, result in results.items():
-        win_rate = result['win_rate']
-        payoff = result['avg_payoff']
-        print(f"{name:<30} {win_rate:<15.2%} {payoff:<15.2f}")
+    for matchup, result in results.items():
+        if 'win_rate' in result:
+            win_rate = result['win_rate']
+            payoff = result['avg_payoff']
+        else:
+            win_rate = result['iteration1_win_rate']
+            payoff = result['iteration1_avg_payoff']
+        
+        print(f"{matchup:<40} {win_rate:<15.2%} {payoff:<15.2f}")
     
     print()
     print("INTERPRETATION:")
     print("-" * 80)
     print("Against weak opponents (random, always_call, baseline):")
     print("  - Should see 60-70%+ win rates if bot is strong")
-    print("  - Lower rates suggest bot needs more training")
+    print("  - Lower rates suggest bot needs more training or has issues")
     print()
-    print("Against early iterations:")
-    print("  - Should see 55-65%+ win rates showing improvement")
-    print("  - Near 50% suggests limited improvement")
-    print()
+    if compare_old:
+        print("Against old checkpoint:")
+        print("  - Should see 55-65%+ win rates showing improvement")
+        print("  - Near 50% suggests limited improvement")
+        print("  - Below 50% suggests regression - investigate!")
+        print()
     print("If win rates are low across all baselines:")
     print("  - Bot may not be converging properly")
-    print("  - Consider checking training process")
+    print("  - Consider checking training process and hyperparameters")
     
     return results
 
 
 if __name__ == "__main__":
     main()
-

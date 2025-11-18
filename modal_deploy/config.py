@@ -15,6 +15,7 @@ image = (
         "numpy>=1.24.0",
         "tqdm>=4.65.0",
         "pandas>=2.0.0",
+        "treys>=0.1.8",
     )
     .add_local_dir(
         os.path.join(project_root, "poker_game"),

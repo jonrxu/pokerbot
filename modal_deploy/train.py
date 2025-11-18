@@ -5,6 +5,9 @@ import torch
 import os
 from typing import List, Dict, Any, Tuple
 import sys
+import collections
+import random
+import pickle
 
 # Add parent directory to path for local imports
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -13,6 +16,33 @@ sys.path.insert(0, parent_dir)
 from modal_deploy.config import image, checkpoint_volume, GPU_CONFIG, CPU_CONFIG, TRAINING_CONFIG
 
 app = modal.App("poker-bot-training")
+
+
+class ReplayBuffer:
+    """Experience replay buffer for stable training."""
+    def __init__(self, maxlen=200000):
+        self.buffer = collections.deque(maxlen=maxlen)
+    
+    def add(self, item):
+        self.buffer.append(item)
+        
+    def extend(self, items):
+        self.buffer.extend(items)
+        
+    def sample(self, batch_size):
+        return random.sample(self.buffer, min(len(self.buffer), batch_size))
+    
+    def __len__(self):
+        return len(self.buffer)
+    
+    def save(self, path):
+        with open(path, 'wb') as f:
+            pickle.dump(self.buffer, f)
+            
+    def load(self, path):
+        if os.path.exists(path):
+            with open(path, 'rb') as f:
+                self.buffer = pickle.load(f)
 
 
 @app.function(
@@ -528,22 +558,53 @@ def train_networks(
     logger.info(f"  Unique info sets with regrets: {len(deep_cfr.regret_memory)}")
     logger.info(f"  Unique info sets with CF values: {len(deep_cfr.counterfactual_values)}")
     
-    # Train networks
-    # Increased to 300 for better learning per iteration (with larger buffers)
-    num_updates = min(300, len(value_buffer) // batch_size)
+    # --- REPLAY BUFFER LOGIC ---
+    # Initialize and load replay buffers to prevent catastrophic forgetting
+    import pickle
+    
+    value_replay = ReplayBuffer(maxlen=200000)
+    policy_replay = ReplayBuffer(maxlen=200000)
+    
+    # Load existing buffers if available
+    value_replay_path = "/checkpoints/value_replay.pkl"
+    policy_replay_path = "/checkpoints/policy_replay.pkl"
+    
+    try:
+        if os.path.exists(value_replay_path):
+            value_replay.load(value_replay_path)
+        if os.path.exists(policy_replay_path):
+            policy_replay.load(policy_replay_path)
+        logger.info(f"Loaded replay buffers: Value={len(value_replay)}, Policy={len(policy_replay)}")
+    except Exception as e:
+        logger.warning(f"Failed to load replay buffers: {e}")
+    
+    # Add new data to replay buffers
+    value_replay.extend(value_buffer)
+    policy_replay.extend(policy_buffer)
+    logger.info(f"Added new samples: Value=+{len(value_buffer)}, Policy=+{len(policy_buffer)}")
+    logger.info(f"Total replay buffer size: Value={len(value_replay)}, Policy={len(policy_replay)}")
+    
+    # Save replay buffers
+    try:
+        value_replay.save(value_replay_path)
+        policy_replay.save(policy_replay_path)
+    except Exception as e:
+        logger.error(f"Failed to save replay buffers: {e}")
+
+    # Train networks using Replay Buffer
+    # We can now perform more updates because we have stable history
+    num_updates = 1000 if len(value_replay) >= batch_size else 0
     value_losses = []
     policy_losses = []
     
     logger.info(f"\n{'='*60}")
-    logger.info(f"NETWORK TRAINING")
+    logger.info(f"NETWORK TRAINING (with Replay Buffer)")
     logger.info(f"{'='*60}")
-    logger.info(f"  Value buffer size: {len(value_buffer)}")
-    logger.info(f"  Policy buffer size: {len(policy_buffer)}")
     logger.info(f"  Batch size: {batch_size}")
-    logger.info(f"  Max updates: {num_updates}")
+    logger.info(f"  Updates: {num_updates}")
     
     if num_updates == 0:
-        logger.warning(f"No updates possible: value_buffer={len(value_buffer)}, policy_buffer={len(policy_buffer)}, batch_size={batch_size}")
+        logger.warning(f"Insufficient data in replay buffer ({len(value_replay)}) for batch size {batch_size}")
         return {
             'iteration': iteration,
             'value_loss': 0.0,
@@ -556,18 +617,22 @@ def train_networks(
     max_grad_norm = 1.0
     
     for update_step in range(num_updates):
-        # Log progress every 20 updates
-        if update_step % 20 == 0 and update_step > 0:
+        # Log progress every 100 updates
+        if update_step % 100 == 0 and update_step > 0:
             avg_value_loss = sum(value_losses) / len(value_losses) if value_losses else 0.0
             avg_policy_loss = sum(policy_losses) / len(policy_losses) if policy_losses else 0.0
             logger.info(f"  Update {update_step}/{num_updates}: Value loss={avg_value_loss:.4f}, Policy loss={avg_policy_loss:.4f}")
         
-        # Update value network
-        if len(value_buffer) >= batch_size:
-            indices = torch.randint(0, len(value_buffer), (batch_size,))
-            batch_states = torch.tensor(np.array([value_buffer[i][0] for i in indices]), dtype=torch.float32).to(device)
-            # CFVs are stored in scaled units (chips / CFV_SCALE)
-            batch_values = torch.tensor([value_buffer[i][1] for i in indices], dtype=torch.float32).to(device).unsqueeze(1)
+        # Update value network from Replay Buffer
+        if len(value_replay) >= batch_size:
+            # Sample from replay buffer
+            batch = value_replay.sample(batch_size)
+            # Unpack batch: list of (state_encoding, value)
+            batch_states_np = np.array([x[0] for x in batch])
+            batch_values_np = np.array([x[1] for x in batch])
+            
+            batch_states = torch.tensor(batch_states_np, dtype=torch.float32).to(device)
+            batch_values = torch.tensor(batch_values_np, dtype=torch.float32).to(device).unsqueeze(1)
             
             deep_cfr.value_optimizer.zero_grad()
             
@@ -607,11 +672,16 @@ def train_networks(
             
             value_losses.append(value_loss.item())
         
-        # Update policy network
-        if len(policy_buffer) >= batch_size:
-            indices = torch.randint(0, len(policy_buffer), (batch_size,))
-            batch_states = torch.tensor(np.array([policy_buffer[i][0] for i in indices]), dtype=torch.float32).to(device)
-            batch_probs = torch.tensor([policy_buffer[i][1] for i in indices], dtype=torch.float32).to(device)
+        # Update policy network from Replay Buffer
+        if len(policy_replay) >= batch_size:
+            # Sample from replay buffer
+            batch = policy_replay.sample(batch_size)
+            # Unpack batch: list of (state_encoding, probs)
+            batch_states_np = np.array([x[0] for x in batch])
+            batch_probs_np = np.array([x[1] for x in batch])
+            
+            batch_states = torch.tensor(batch_states_np, dtype=torch.float32).to(device)
+            batch_probs = torch.tensor(batch_probs_np, dtype=torch.float32).to(device)
             
             deep_cfr.policy_optimizer.zero_grad()
             

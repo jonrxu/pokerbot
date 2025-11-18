@@ -79,22 +79,21 @@ class DeepCFR:
         # Get regrets for this information set
         regrets = self.regret_memory[key]
         
-        # If no regrets yet, return uniform
-        if not regrets or len(regrets) != len(legal_actions):
-            return {i: 1.0 / len(legal_actions) for i in range(len(legal_actions))}
-        
         # Filter regrets to only include valid indices (0 to len(legal_actions)-1)
         # This handles cases where regret_memory has stale indices from different states
         # that share the same information set but have different legal actions
         max_valid_idx = len(legal_actions) - 1
-        valid_regrets = {idx: regret for idx, regret in regrets.items() 
-                        if 0 <= idx <= max_valid_idx}
+        valid_regrets = {idx: regrets.get(idx, 0.0) for idx in range(len(legal_actions))}
         
-        # If no valid regrets, return uniform
-        if not valid_regrets:
+        # CRITICAL FIX: Ensure we have regrets for ALL legal actions
+        # If an action has no regret entry, it defaults to 0.0 (which is correct)
+        # Now we can safely do regret matching even if some actions have zero regret
+        
+        # If no regrets at all (all zeros), return uniform
+        if not valid_regrets or all(r == 0.0 for r in valid_regrets.values()):
             return {i: 1.0 / len(legal_actions) for i in range(len(legal_actions))}
         
-        # Regret matching on valid regrets only
+        # Regret matching on all legal actions (with zero regrets for untaken actions)
         return self.regret_matching(valid_regrets)
     
     def sample_action(self, strategy: Dict[int, float]) -> int:
@@ -224,15 +223,23 @@ class DeepCFR:
     
     def compute_average_strategy(self, info_set: InformationSet, 
                                 legal_actions: List[Tuple[Action, int]]) -> Dict[int, float]:
-        """Compute average strategy from accumulated regrets."""
+        """Compute average strategy from accumulated strategy memory."""
         key = info_set.key
         
-        # Get accumulated strategy
+        # Get accumulated strategy - ensure all legal actions are represented
         strategy_sum = self.strategy_memory.get(key, {})
-        total = sum(strategy_sum.values())
         
-        if total > 0:
-            return {a: s / total for a, s in strategy_sum.items()}
+        # Build strategy for all legal actions, defaulting to 0.0 if not accumulated
+        avg_strategy = {}
+        total = 0.0
+        for idx in range(len(legal_actions)):
+            accumulated = strategy_sum.get(idx, 0.0)
+            avg_strategy[idx] = accumulated
+            total += accumulated
+        
+        if total > 1e-8:  # Use small epsilon to avoid floating point issues
+            # Normalize
+            return {a: s / total for a, s in avg_strategy.items()}
         else:
             # Uniform if no strategy accumulated
             return {i: 1.0 / len(legal_actions) for i in range(len(legal_actions))}
