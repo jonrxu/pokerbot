@@ -8,6 +8,7 @@ import sys
 import collections
 import random
 import pickle
+from datetime import datetime
 
 # Add parent directory to path for local imports
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -19,8 +20,8 @@ app = modal.App("poker-bot-training")
 
 
 class ReplayBuffer:
-    """Experience replay buffer for stable training."""
-    def __init__(self, maxlen=200000):
+    """Experience replay buffer for stable training (Sliding Window)."""
+    def __init__(self, maxlen=50000): 
         self.buffer = collections.deque(maxlen=maxlen)
     
     def add(self, item):
@@ -43,6 +44,64 @@ class ReplayBuffer:
         if os.path.exists(path):
             with open(path, 'rb') as f:
                 self.buffer = pickle.load(f)
+
+
+class PolicyReservoirBuffer:
+    """Reservoir Sampling buffer for Policy Network (Long-term Average).
+    
+    Approximates uniform sampling over ALL past history without infinite memory.
+    Used to learn the Nash Equilibrium average strategy.
+    """
+    def __init__(self, capacity=2000000):
+        self.capacity = capacity
+        self.buffer = []
+        self.total_seen = 0
+        
+    def add(self, item):
+        self.total_seen += 1
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(item)
+        else:
+            # Reservoir logic: replace random existing item with probability k/n
+            idx = random.randint(0, self.total_seen - 1)
+            if idx < self.capacity:
+                self.buffer[idx] = item
+                
+    def extend(self, items):
+        for item in items:
+            self.add(item)
+            
+    def sample(self, batch_size):
+        if not self.buffer:
+            return []
+        return random.sample(self.buffer, min(len(self.buffer), batch_size))
+        
+    def __len__(self):
+        return len(self.buffer)
+        
+    def save(self, path):
+        state = {
+            'buffer': self.buffer,
+            'total_seen': self.total_seen,
+            'capacity': self.capacity
+        }
+        with open(path, 'wb') as f:
+            pickle.dump(state, f)
+            
+    def load(self, path):
+        if os.path.exists(path):
+            with open(path, 'rb') as f:
+                try:
+                    state = pickle.load(f)
+                    if isinstance(state, dict):
+                        self.buffer = state.get('buffer', [])
+                        self.total_seen = state.get('total_seen', 0)
+                        self.capacity = state.get('capacity', self.capacity)
+                    else:
+                        # Handle legacy or format mismatch
+                        pass 
+                except Exception:
+                    pass
 
 
 @app.function(
@@ -69,14 +128,7 @@ def generate_trajectories(
     checkpoint_path: str = None,
     iteration: int = 0
 ) -> Dict[str, List]:
-    """Generate self-play trajectories (CPU workers).
-    
-    Returns a dictionary containing training buffers:
-    {
-        'advantage': [(state, advantage_vector), ...],
-        'policy': [(state, policy_vector), ...]
-    }
-    """
+    """Generate self-play trajectories (CPU workers)."""
     from collections import defaultdict
     from poker_game.game import PokerGame
     from poker_game.state_encoder import StateEncoder
@@ -94,10 +146,16 @@ def generate_trajectories(
     policy_net = PolicyNet(input_dim=input_dim)
     
     # Load checkpoint if available
-    if checkpoint_path and os.path.exists(f"/checkpoints/{checkpoint_path}"):
+    full_path = None
+    if checkpoint_path:
+        if checkpoint_path.startswith("/"):
+            full_path = checkpoint_path
+        else:
+            full_path = f"/checkpoints/{checkpoint_path}"
+
+    if full_path and os.path.exists(full_path):
         try:
-            checkpoint = torch.load(f"/checkpoints/{checkpoint_path}", map_location='cpu', weights_only=False)
-            # Validate checkpoint has required keys
+            checkpoint = torch.load(full_path, map_location='cpu', weights_only=False)
             required_keys = ['advantage_net_state', 'policy_net_state']
             if all(key in checkpoint for key in required_keys):
                 advantage_net.load_state_dict(checkpoint['advantage_net_state'])
@@ -125,14 +183,25 @@ def generate_trajectories(
         'policy': []
     }
     
-    # Generate trajectories via external sampling traversal
-    for _ in range(num_trajectories):
+    # Generate trajectories via Outcome Sampling traversal
+    max_samples_per_trajectory = 200
+    
+    for traj_idx in range(num_trajectories):
         state = game.reset()
-        # Randomly choose a player to traverse (train)
-        # The other player will be simulated using the PolicyNet (average strategy)
         traversal_player = random.randint(0, 1)
         
-        deep_cfr.traverse_external_sampling(state, traversal_player, buffers)
+        # Linear CFR weighting: later iterations get higher weight
+        iteration_weight = float(iteration + 1)
+        
+        # Use Outcome Sampling
+        deep_cfr.traverse_outcome_sampling(
+            state, 
+            traversal_player, 
+            buffers, 
+            iteration_weight=iteration_weight,
+            max_depth=40,
+            sample_reach=1.0
+        )
         
     return buffers
 
@@ -147,7 +216,8 @@ def train_networks(
     worker_buffers: List[Dict[str, List]],
     checkpoint_path: str = None,
     iteration: int = 0,
-    batch_size: int = 32
+    batch_size: int = 32,
+    run_id: str = "default"
 ) -> Dict[str, Any]:
     """Train networks on aggregated buffers (GPU workers)."""
     import numpy as np
@@ -157,6 +227,7 @@ def train_networks(
     from models.advantage_net import AdvantageNet
     from models.policy_net import PolicyNet
     from training.deep_cfr import DeepCFR
+    import torch.optim as optim
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
@@ -170,6 +241,10 @@ def train_networks(
     # Log GPU availability
     import logging
     import sys
+    
+    run_dir = f"/checkpoints/{run_id}"
+    os.makedirs(run_dir, exist_ok=True)
+
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
@@ -194,19 +269,26 @@ def train_networks(
     advantage_net = AdvantageNet(input_dim=input_dim).to(device)
     policy_net = PolicyNet(input_dim=input_dim).to(device)
     
-    if checkpoint_path and os.path.exists(f"/checkpoints/{checkpoint_path}"):
+    # Load checkpoint if available
+    full_path = None
+    if checkpoint_path:
+        if checkpoint_path.startswith("/"):
+            full_path = checkpoint_path
+        else:
+            full_path = f"/checkpoints/{checkpoint_path}"
+
+    if full_path and os.path.exists(full_path):
         try:
-            checkpoint = torch.load(f"/checkpoints/{checkpoint_path}", map_location=device, weights_only=False)
-            # Validate checkpoint has required keys
+            checkpoint = torch.load(full_path, map_location=device, weights_only=False)
             required_keys = ['advantage_net_state', 'policy_net_state']
             if all(key in checkpoint for key in required_keys):
                 advantage_net.load_state_dict(checkpoint['advantage_net_state'])
                 policy_net.load_state_dict(checkpoint['policy_net_state'])
-                logging.info(f"Successfully loaded checkpoint from {checkpoint_path}")
+                logging.info(f"Successfully loaded checkpoint from {full_path}")
             else:
-                logging.warning(f"Checkpoint {checkpoint_path} missing required keys. Using new networks.")
+                logging.warning(f"Checkpoint {full_path} missing required keys. Using new networks.")
         except Exception as e:
-            logging.warning(f"Failed to load checkpoint {checkpoint_path}: {e}. Using new networks.")
+            logging.warning(f"Failed to load checkpoint {full_path}: {e}. Using new networks.")
     
     # Initialize Deep CFR
     deep_cfr = DeepCFR(
@@ -218,10 +300,10 @@ def train_networks(
         device=device
     )
     
-    # Load optimizer states if available
-    if checkpoint_path and os.path.exists(f"/checkpoints/{checkpoint_path}"):
+    # Load optimizer states
+    if full_path and os.path.exists(full_path):
         try:
-            checkpoint = torch.load(f"/checkpoints/{checkpoint_path}", map_location=device, weights_only=False)
+            checkpoint = torch.load(full_path, map_location=device, weights_only=False)
             if 'advantage_optimizer_state' in checkpoint:
                 deep_cfr.advantage_optimizer.load_state_dict(checkpoint['advantage_optimizer_state'])
             if 'policy_optimizer_state' in checkpoint:
@@ -229,17 +311,56 @@ def train_networks(
         except Exception as e:
             logging.warning(f"Failed to load optimizer states: {e}")
 
-    # --- REPLAY BUFFER LOGIC ---
+    # --- LR SCHEDULER ---
+    # Decay LR by 0.98 every iteration
+    adv_scheduler = optim.lr_scheduler.ExponentialLR(deep_cfr.advantage_optimizer, gamma=0.98)
+    pol_scheduler = optim.lr_scheduler.ExponentialLR(deep_cfr.policy_optimizer, gamma=0.98)
+
+    # --- REPLAY BUFFER LOGIC (PHASE 4) ---
+    # Advantage: Short-term history (Sliding Window 200k ~ 3-4 iterations)
     advantage_replay = ReplayBuffer(maxlen=200000)
-    policy_replay = ReplayBuffer(maxlen=200000)
+    
+    # Policy: Long-term history (Reservoir Sampling 2M ~ 30+ iterations)
+    # This allows converging to Nash Equilibrium (Average Strategy)
+    policy_replay = PolicyReservoirBuffer(capacity=2000000)
     
     # Load existing buffers
+    # Note: For Phase 4, we might want to RESET the policy buffer if starting a fresh run
+    # but keep the advantage buffer if resuming?
+    # Actually, if we start a new run_id, we usually start fresh buffers UNLESS resuming.
+    # But user wants to "kickstart" from Iter 14.
+    # If we load old buffers, we might load the small deque into the Reservoir?
+    # Let's handle that.
+    
     try:
-        if os.path.exists("/checkpoints/advantage_replay.pkl"): advantage_replay.load("/checkpoints/advantage_replay.pkl")
-        if os.path.exists("/checkpoints/policy_replay.pkl"): policy_replay.load("/checkpoints/policy_replay.pkl")
-        logger.info(f"Loaded replay buffers: Adv={len(advantage_replay)}, Pol={len(policy_replay)}")
+        if os.path.exists("/checkpoints/advantage_replay.pkl"): 
+            advantage_replay.load("/checkpoints/advantage_replay.pkl")
+            # Resize if needed
+            if len(advantage_replay) > advantage_replay.buffer.maxlen:
+                 import collections
+                 new_q = collections.deque(list(advantage_replay.buffer)[-advantage_replay.buffer.maxlen:], maxlen=advantage_replay.buffer.maxlen)
+                 advantage_replay.buffer = new_q
+            
+        if os.path.exists("/checkpoints/policy_replay.pkl"): 
+            # Attempt to load. If it's a deque (old), we should probably convert or discard.
+            # Given we want to start Phase 4 properly, DISCARDING old policy data is safer
+            # to avoid polluting the reservoir with non-reservoir data.
+            # However, losing 14 iterations of data is sad.
+            # Let's try to load and populate the reservoir.
+            with open("/checkpoints/policy_replay.pkl", 'rb') as f:
+                data = pickle.load(f)
+                if isinstance(data, collections.deque):
+                    logger.info(f"Converting legacy Policy deque (len={len(data)}) to Reservoir...")
+                    policy_replay.extend(list(data))
+                elif isinstance(data, dict) and 'buffer' in data:
+                    # It's already a reservoir state
+                    policy_replay.buffer = data['buffer']
+                    policy_replay.total_seen = data['total_seen']
+                    policy_replay.capacity = data['capacity']
+                 
+        logger.info(f"Loaded buffers: Adv={len(advantage_replay)}, Pol={len(policy_replay)} (Total Seen: {policy_replay.total_seen})")
     except Exception as e:
-        logger.warning(f"Failed to load replay buffers: {e}")
+        logger.warning(f"Failed to load replay buffers (starting fresh): {e}")
 
     # Aggregated new data from workers
     new_advantage_count = 0
@@ -261,7 +382,7 @@ def train_networks(
         logger.error(f"Failed to save replay buffers: {e}")
 
     # --- TRAINING LOOP ---
-    # Updates proportional to buffer size
+    # Updates proportional to buffer size, but capped
     num_updates = 1000 if len(advantage_replay) >= batch_size else 0
     
     advantage_losses = []
@@ -305,34 +426,53 @@ def train_networks(
                 deep_cfr.advantage_optimizer.step()
             advantage_losses.append(loss.item())
 
-        # 2. Train Policy Net (Cross Entropy / KL)
+        # 2. Train Policy Net (Cross Entropy / KL) with Linear CFR weighting
         if len(policy_replay) >= batch_size:
             batch = policy_replay.sample(batch_size)
-            states = torch.tensor(np.array([x[0] for x in batch]), dtype=torch.float32).to(device)
-            targets = torch.tensor(np.array([x[1] for x in batch]), dtype=torch.float32).to(device)
+            # Support both legacy (state, target) and new (state, target, weight) formats
+            states_np = np.array([x[0] for x in batch])
+            targets_np = np.array([x[1] for x in batch])
+            weights_np = np.array([float(x[2]) if len(x) > 2 else 1.0 for x in batch], dtype=np.float32)
+
+            states = torch.tensor(states_np, dtype=torch.float32).to(device)
+            targets = torch.tensor(targets_np, dtype=torch.float32).to(device)
+            weights = torch.tensor(weights_np, dtype=torch.float32).to(device)
+
+            # Normalize weights
+            weights = weights / (weights.mean() + 1e-8)
             
             deep_cfr.policy_optimizer.zero_grad()
+
+            def weighted_kl_loss(logits, targets, weights):
+                log_probs = torch.log_softmax(logits, dim=1)
+                log_targets = torch.log(targets + 1e-8)
+                sample_kl = (targets * (log_targets - log_probs)).sum(dim=1)
+                weighted = sample_kl * weights
+                return weighted.sum() / (weights.sum() + 1e-8)
+
             if use_amp:
                 with autocast('cuda'):
                     logits = policy_net(states)
-                    # KL Div Loss
-                    probs = torch.softmax(logits, dim=1)
-                    loss = torch.nn.KLDivLoss(reduction='batchmean')(torch.log(probs + 1e-8), targets)
+                    loss = weighted_kl_loss(logits, targets, weights)
                 scaler.scale(loss).backward()
                 scaler.unscale_(deep_cfr.policy_optimizer)
                 torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_grad_norm)
                 scaler.step(deep_cfr.policy_optimizer)
             else:
                 logits = policy_net(states)
-                probs = torch.softmax(logits, dim=1)
-                loss = torch.nn.KLDivLoss(reduction='batchmean')(torch.log(probs + 1e-8), targets)
+                loss = weighted_kl_loss(logits, targets, weights)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_grad_norm)
                 deep_cfr.policy_optimizer.step()
+
             policy_losses.append(loss.item())
             
         if use_amp:
             scaler.update()
+            
+    # Step schedulers
+    adv_scheduler.step()
+    pol_scheduler.step()
 
     # Prepare updated checkpoint
     checkpoint = {
@@ -343,14 +483,20 @@ def train_networks(
         'policy_optimizer_state': deep_cfr.policy_optimizer.state_dict(),
     }
     
-    # Save checkpoint atomically
-    checkpoint_file = f"/checkpoints/checkpoint_iter_{iteration}.pt"
-    temp_checkpoint_file = f"/checkpoints/checkpoint_iter_{iteration}.pt.tmp"
+    # Save checkpoint atomically to RUN DIR
+    checkpoint_file = f"{run_dir}/checkpoint_iter_{iteration}.pt"
+    temp_checkpoint_file = f"{run_dir}/checkpoint_iter_{iteration}.pt.tmp"
     
     try:
         torch.save(checkpoint, temp_checkpoint_file)
         os.rename(temp_checkpoint_file, checkpoint_file)
         logger.info(f"Checkpoint saved: {checkpoint_file}")
+        
+        # Also copy to root
+        root_checkpoint = f"/checkpoints/checkpoint_iter_{iteration}.pt"
+        import shutil
+        shutil.copy2(checkpoint_file, root_checkpoint)
+        
     except Exception as e:
         logger.error(f"Failed to save checkpoint: {e}")
         if os.path.exists(temp_checkpoint_file):
@@ -375,159 +521,6 @@ def train_networks(
 @app.function(
     image=image,
     volumes={"/checkpoints": checkpoint_volume},
-    **CPU_CONFIG,
-    timeout=1800,
-)
-def evaluate_agents(
-    checkpoint_paths: List[str],
-    num_games: int = 100
-) -> Dict[str, Any]:
-    """Evaluate agents head-to-head."""
-    results = {}
-    
-    # Load agents
-    agents = {}
-    for path in checkpoint_paths:
-        if os.path.exists(f"/checkpoints/{path}"):
-            checkpoint = torch.load(f"/checkpoints/{path}", map_location='cpu', weights_only=False)
-            # Create agent from checkpoint
-            agents[path] = checkpoint
-    
-    # Run head-to-head matches
-    for i, path1 in enumerate(checkpoint_paths):
-        for j, path2 in enumerate(checkpoint_paths):
-            if i >= j:
-                continue
-            
-            # Play games
-            wins = [0, 0]
-            total_payoff = [0.0, 0.0]
-            
-            # Simplified evaluation - would need full agent implementation
-            # For now, return placeholder results
-            results[f"{path1}_vs_{path2}"] = {
-                'wins': wins,
-                'payoffs': total_payoff,
-                'win_rate': [w / num_games for w in wins]
-            }
-    
-    return results
-
-
-def small_evaluation(iteration: int, num_games: int = 200) -> Dict[str, Any]:
-    """
-    Run a small evaluation of the current checkpoint against simple baselines.
-    This is used inside the training loop for cheap sanity checks.
-    """
-    import os
-    import random
-    import numpy as np
-    import torch
-    from poker_game.game import PokerGame, Action
-    from poker_game.state_encoder import StateEncoder
-    from models.policy_net import PolicyNet
-
-    checkpoint_path = f"/checkpoints/checkpoint_iter_{iteration}.pt"
-    if not os.path.exists(checkpoint_path):
-        return {}
-
-    # Initialize game and state encoder
-    game = PokerGame(small_blind=50, big_blind=100, is_limit=False)
-    encoder = StateEncoder()
-    input_dim = encoder.feature_dim
-
-    # Load current policy network
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    if "policy_net_state" not in checkpoint:
-        return {}
-    current_net = PolicyNet(input_dim=input_dim)
-    current_net.load_state_dict(checkpoint["policy_net_state"])
-    current_net.eval()
-
-    # Baseline agents
-    class RandomAgent:
-        def get_action(self, state, legal_actions):
-            if not legal_actions:
-                return (Action.FOLD, 0)
-            return random.choice(legal_actions)
-
-    class AlwaysCallAgent:
-        def get_action(self, state, legal_actions):
-            to_call = state.current_bets[1 - state.current_player] - state.current_bets[state.current_player]
-            if to_call == 0:
-                for a, amt in legal_actions:
-                    if a == Action.CHECK:
-                        return (a, amt)
-            else:
-                for a, amt in legal_actions:
-                    if a == Action.CALL:
-                        return (a, amt)
-            return (Action.FOLD, 0)
-
-    def play_match(opponent, num_games: int) -> Tuple[float, float]:
-        wins = 0
-        total_payoff = 0.0
-        for _ in range(num_games):
-            state = game.reset()
-            # Randomly assign positions
-            current_is_player0 = random.random() < 0.5
-
-            while not state.is_terminal:
-                player = state.current_player
-                legal_actions = game.get_legal_actions(state)
-                if not legal_actions:
-                    break
-
-                if (player == 0 and current_is_player0) or (player == 1 and not current_is_player0):
-                    # Current bot's turn
-                    enc = encoder.encode(state, player)
-                    t = torch.tensor(enc, dtype=torch.float32).unsqueeze(0)
-                    with torch.no_grad():
-                        logits = current_net(t)
-                        probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
-                    num_legal = len(legal_actions)
-                    legal_probs = probs[:num_legal]
-                    if legal_probs.sum() > 0:
-                        legal_probs /= legal_probs.sum()
-                    else:
-                        legal_probs = np.ones(num_legal) / num_legal
-                    idx = np.random.choice(num_legal, p=legal_probs)
-                    action, amount = legal_actions[idx]
-                else:
-                    # Opponent's turn
-                    action, amount = opponent.get_action(state, legal_actions)
-
-                state = game.apply_action(state, action, amount)
-
-            payoffs = game.get_payoff(state)
-            if current_is_player0:
-                total_payoff += payoffs[0]
-                if payoffs[0] > payoffs[1]:
-                    wins += 1
-            else:
-                total_payoff += payoffs[1]
-                if payoffs[1] > payoffs[0]:
-                    wins += 1
-
-        return wins / num_games, total_payoff / num_games
-
-    random_agent = RandomAgent()
-    always_call_agent = AlwaysCallAgent()
-
-    rand_wr, rand_ev = play_match(random_agent, num_games)
-    call_wr, call_ev = play_match(always_call_agent, num_games)
-
-    return {
-        "eval_random_win_rate": rand_wr,
-        "eval_random_ev": rand_ev,
-        "eval_always_call_win_rate": call_wr,
-        "eval_always_call_ev": call_ev,
-    }
-
-
-@app.function(
-    image=image,
-    volumes={"/checkpoints": checkpoint_volume},
     cpu=2,
     memory=4096,
     timeout=86400,  # 24 hours
@@ -537,15 +530,18 @@ def training_worker(
     trajectories_per_iteration: int,
     num_workers: int,
     start_iteration: int = 0,
-    batch_size: int = 32
+    batch_size: int = 32,
+    run_id: str = "default"
 ):
     """Main training worker that runs asynchronously."""
     import logging
     import sys
     from modal_deploy.metrics import MetricsLogger
     
-    # Set up logging to both file and stdout
-    log_file = '/checkpoints/training.log'
+    run_dir = f"/checkpoints/{run_id}"
+    os.makedirs(run_dir, exist_ok=True)
+    
+    log_file = f'{run_dir}/training.log'
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
@@ -557,27 +553,17 @@ def training_worker(
     )
     logger = logging.getLogger(__name__)
     
-    # Initialize metrics directory
-    import os
-    os.makedirs("/checkpoints/metrics", exist_ok=True)
+    metrics_logger = MetricsLogger(log_dir=run_dir)
     
-    # Initialize metrics logger
-    metrics_logger = MetricsLogger(log_dir="/checkpoints/metrics")
-    
-    logger.info(f"Starting training: {num_iterations} iterations, {trajectories_per_iteration} trajectories/iter")
+    logger.info(f"Starting training run: {run_id}")
+    logger.info(f"Config: {num_iterations} iterations, {trajectories_per_iteration} trajectories/iter")
     logger.info(f"Starting from iteration {start_iteration}")
     
-    # Initialize iteration variable before try block for exception handling
     iteration = start_iteration
     
-    # Validate worker configuration
     if num_workers > trajectories_per_iteration:
         logger.error(f"num_workers ({num_workers}) > trajectories_per_iteration ({trajectories_per_iteration}). This will result in 0 trajectories per worker!")
         raise ValueError(f"num_workers must be <= trajectories_per_iteration")
-    
-    if num_workers <= 0:
-        logger.error(f"num_workers must be > 0, got {num_workers}")
-        raise ValueError(f"num_workers must be > 0")
     
     try:
         for iteration in range(start_iteration, num_iterations):
@@ -585,22 +571,26 @@ def training_worker(
             logger.info(f"Iteration {iteration + 1}/{num_iterations}")
             logger.info(f"{'='*60}")
             
-            # Determine checkpoint path
             checkpoint_path = None
             if iteration > 0:
-                checkpoint_path = f"checkpoint_iter_{iteration - 1}.pt"
-            
-            # Generate trajectories in parallel
-            trajectories_per_worker = trajectories_per_iteration // num_workers
-            remainder = trajectories_per_iteration % num_workers
+                checkpoint_path = f"{run_id}/checkpoint_iter_{iteration - 1}.pt"
+            elif iteration == 0 and os.path.exists("/checkpoints/checkpoint_iter_19.pt"):
+                logger.info("Bootstrapping from /checkpoints/checkpoint_iter_19.pt")
+                checkpoint_path = "checkpoint_iter_19.pt"
+            elif start_iteration > 0 and iteration == start_iteration:
+                # Look for legacy checkpoint if new structure missing
+                legacy_path = f"checkpoint_iter_{iteration - 1}.pt"
+                if os.path.exists(f"/checkpoints/{legacy_path}"):
+                    checkpoint_path = legacy_path
+                    logger.info(f"Resuming from legacy checkpoint: {legacy_path}")
+                else:
+                     logger.warning(f"Could not find resume checkpoint for iter {iteration-1}")
             
             logger.info(f"Generating {trajectories_per_iteration} trajectories using {num_workers} workers...")
-            logger.info(f"Trajectories per worker: {trajectories_per_worker} (remainder: {remainder})")
             
             trajectory_futures = []
             for worker_id in range(num_workers):
-                # Distribute remainder to first few workers
-                worker_trajectories = trajectories_per_worker + (1 if worker_id < remainder else 0)
+                worker_trajectories = trajectories_per_iteration // num_workers + (1 if worker_id < (trajectories_per_iteration % num_workers) else 0)
                 future = generate_trajectories.spawn(
                     num_trajectories=worker_trajectories,
                     checkpoint_path=checkpoint_path,
@@ -608,7 +598,6 @@ def training_worker(
                 )
                 trajectory_futures.append(future)
             
-            # Collect buffers with retry logic
             all_worker_buffers = []
             max_worker_retries = 2
             total_trajectories = 0
@@ -616,58 +605,50 @@ def training_worker(
             for i in range(num_workers):
                 retry_count = 0
                 worker_success = False
-                worker_trajectories = trajectories_per_worker + (1 if i < remainder else 0)
                 
                 while retry_count < max_worker_retries and not worker_success:
                     try:
-                        # Get or create future for this worker
                         if retry_count == 0:
                             future = trajectory_futures[i]
                         else:
-                            # Respawn worker on retry
-                            logger.warning(f"Worker {i+1} failed (attempt {retry_count}/{max_worker_retries}). Retrying...")
+                            logger.warning(f"Worker {i+1} failed (attempt {retry_count}). Retrying...")
+                            worker_trajectories = trajectories_per_iteration // num_workers + (1 if i < (trajectories_per_iteration % num_workers) else 0)
                             future = generate_trajectories.spawn(
                                 num_trajectories=worker_trajectories,
                                 checkpoint_path=checkpoint_path,
                                 iteration=iteration
                             )
                         
-                        buffers = future.get(timeout=3600)  # 1 hour timeout per worker
+                        buffers = future.get(timeout=3600)
                         all_worker_buffers.append(buffers)
-                        
-                        # Count total items
-                        item_count = len(buffers['advantage'])
-                        total_trajectories += worker_trajectories # Approximate
-                        logger.info(f"Worker {i+1}/{num_workers} completed: {item_count} samples")
+                        total_trajectories += len(buffers['advantage']) # Approx
+                        logger.info(f"Worker {i+1}/{num_workers} completed: {len(buffers['advantage'])} samples")
                         worker_success = True
                     except Exception as e:
                         retry_count += 1
                         if retry_count >= max_worker_retries:
-                            logger.error(f"Worker {i+1} failed after {max_worker_retries} attempts: {e}")
+                            logger.error(f"Worker {i+1} failed: {e}")
                             break
             
             logger.info(f"Total worker buffers collected: {len(all_worker_buffers)}")
             
             if len(all_worker_buffers) == 0:
-                logger.error("No data generated! Skipping this iteration.")
+                logger.error("No data generated! Skipping.")
                 continue
             
-            # Train networks
             logger.info("Training networks on GPU...")
             try:
                 train_result = train_networks.spawn(
                     worker_buffers=all_worker_buffers,
                     checkpoint_path=checkpoint_path,
                     iteration=iteration,
-                    batch_size=batch_size
-                ).get(timeout=7200)  # 2 hour timeout
+                    batch_size=batch_size,
+                    run_id=run_id
+                ).get(timeout=7200)
             except Exception as e:
                 logger.error(f"Training networks failed: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
                 raise
             
-            # Log metrics
             metrics = {
                 "iteration": iteration + 1,
                 "trajectories_generated": total_trajectories,
@@ -676,40 +657,21 @@ def training_worker(
                 "checkpoint_path": train_result.get('checkpoint_path', ''),
                 "num_updates": train_result.get('num_updates', 0)
             }
-
-            # Occasionally run a small evaluation
-            if (iteration + 1) % 5 == 0 and train_result.get('checkpoint_path'):
-                try:
-                    eval_metrics = small_evaluation(iteration)
-                    if eval_metrics:
-                        metrics.update(eval_metrics)
-                except Exception as e:
-                    logger.warning(f"Small evaluation failed at iteration {iteration + 1}: {e}")
             
             try:
                 metrics_logger.log_iteration(iteration + 1, metrics)
             except Exception as e:
                 logger.error(f"Failed to log metrics: {e}")
             
-            logger.info(f"Training complete:")
-            logger.info(f"  Advantage loss: {metrics['advantage_loss']:.6f}")
-            logger.info(f"  Policy loss: {metrics['policy_loss']:.6f}")
-            logger.info(f"  Checkpoint: {metrics['checkpoint_path']}")
+            logger.info(f"Training complete: Adv Loss={metrics['advantage_loss']:.4f}, Pol Loss={metrics['policy_loss']:.4f}")
             
-            # Commit volume
             try:
                 checkpoint_volume.commit()
             except Exception as e:
                 logger.warning(f"Volume commit failed: {e}")
-            
-            # Checkpoint frequency
-            if (iteration + 1) % TRAINING_CONFIG['checkpoint_frequency'] == 0:
-                logger.info(f"✓ Major checkpoint milestone at iteration {iteration + 1}")
     
     except Exception as e:
-        logger.error(f"Training interrupted at iteration {iteration}: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
+        logger.error(f"Training interrupted: {e}")
         raise
     finally:
         logger.info("Training worker finished.")
@@ -717,7 +679,7 @@ def training_worker(
 @app.local_entrypoint()
 def main(
     num_iterations: int = 1000,
-    trajectories_per_iteration: int = 10000,
+    trajectories_per_iteration: int = 20000,
     num_workers: int = 4,
     resume_from: int = None,
     batch_size: int = 32,
@@ -725,6 +687,11 @@ def main(
 ):
     """Main entrypoint for training."""
     start_iteration = resume_from if resume_from else 0
+    
+    import datetime
+    run_id = f"run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    print(f"Initializing Training Run: {run_id}")
+    print(f"Phase 4: Reservoir Sampling (Policy Buffer Capacity: 2,000,000)")
     
     if deploy:
         print("Deploying app to Modal...")
@@ -737,9 +704,11 @@ def main(
             trajectories_per_iteration=trajectories_per_iteration,
             num_workers=num_workers,
             start_iteration=start_iteration,
-            batch_size=batch_size
+            batch_size=batch_size,
+            run_id=run_id
         )
         print(f"Job triggered: {future.object_id}")
+        print(f"Monitor logs with: modal app logs poker-bot-training")
         
     else:
         print(f"Starting local training...")
@@ -748,5 +717,6 @@ def main(
             trajectories_per_iteration=trajectories_per_iteration,
             num_workers=num_workers,
             start_iteration=start_iteration,
-            batch_size=batch_size
+            batch_size=batch_size,
+            run_id=run_id
         )

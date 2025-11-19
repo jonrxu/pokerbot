@@ -45,10 +45,9 @@ class PolicyNet(PokerNet):
         logits = self.policy_head(features)
         return logits
     
-    def get_policy(self, x, legal_actions_mask=None):
+    def get_policy_probs(self, x, legal_actions_mask=None):
         """Get softmax policy for legal actions."""
-        features = super().forward(x)
-        logits = self.policy_head(features)
+        logits = self.forward(x)
         
         if legal_actions_mask is not None:
             # Mask illegal actions with large negative value
@@ -56,3 +55,5 @@ class PolicyNet(PokerNet):
         
         return torch.softmax(logits, dim=-1)
 
+    # Alias for backward compatibility if needed
+    get_policy = get_policy_probs

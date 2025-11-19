@@ -189,8 +189,8 @@ def evaluate_against_baseline_modal(
                 state_tensor = torch.tensor(state_encoding, dtype=torch.float32).unsqueeze(0)
                 
                 with torch.no_grad():
-                    _, policy_logits = current_net(state_tensor)
-                    action_probs = torch.softmax(policy_logits, dim=1).cpu().numpy()[0]
+                    logits = current_net(state_tensor)
+                    action_probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
                 
                 num_legal = len(legal_actions)
                 if num_legal == 0:
@@ -210,8 +210,8 @@ def evaluate_against_baseline_modal(
                     state_tensor = torch.tensor(state_encoding, dtype=torch.float32).unsqueeze(0)
                     
                     with torch.no_grad():
-                        _, policy_logits = baseline_net(state_tensor)
-                        action_probs = torch.softmax(policy_logits, dim=1).cpu().numpy()[0]
+                        logits = baseline_net(state_tensor)
+                        action_probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
                     
                     num_legal = len(legal_actions)
                     if num_legal == 0:
@@ -272,17 +272,16 @@ def evaluate_checkpoints_modal(
     import os
     import torch
     import numpy as np
+    import random
     from poker_game.game import PokerGame
     from poker_game.state_encoder import StateEncoder
     from models.policy_net import PolicyNet
-    from evaluation.evaluator import Evaluator
     
     print(f"Evaluating iteration {iteration1} vs iteration {iteration2}")
     print(f"Games: {num_games}")
     
     game = PokerGame(small_blind=50, big_blind=100, is_limit=False)
     state_encoder = StateEncoder()
-    evaluator = Evaluator(game, state_encoder)
     
     def load_network(checkpoint_path):
         if not os.path.exists(checkpoint_path):
@@ -301,24 +300,87 @@ def evaluate_checkpoints_modal(
     
     print(f"Loading checkpoint 1: {checkpoint1_path}")
     network1 = load_network(checkpoint1_path)
+    network1.eval()
     
     print(f"Loading checkpoint 2: {checkpoint2_path}")
     network2 = load_network(checkpoint2_path)
+    network2.eval()
     
     print("Running evaluation...")
-    result = evaluator.evaluate_agents(
-        network1, network2, num_games=num_games, device='cpu'
-    )
+    
+    # Run head-to-head games
+    agent1_wins = 0
+    agent2_wins = 0
+    agent1_payoff = 0.0
+    agent2_payoff = 0.0
+    
+    for game_num in range(num_games):
+        state = game.reset()
+        
+        # Randomly assign positions
+        agent1_is_player0 = random.random() < 0.5
+        
+        while not state.is_terminal:
+            player = state.current_player
+            legal_actions = game.get_legal_actions(state)
+            
+            if len(legal_actions) == 0:
+                break
+            
+            # Determine which agent is playing
+            if (player == 0 and agent1_is_player0) or (player == 1 and not agent1_is_player0):
+                current_net = network1
+            else:
+                current_net = network2
+            
+            # Get action from network
+            state_encoding = state_encoder.encode(state, player)
+            state_tensor = torch.tensor(state_encoding, dtype=torch.float32).unsqueeze(0)
+            
+            with torch.no_grad():
+                logits = current_net(state_tensor)
+                action_probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
+            
+            num_legal = len(legal_actions)
+            if num_legal == 0:
+                break
+            
+            legal_probs = action_probs[:num_legal]
+            if legal_probs.sum() > 0:
+                legal_probs = legal_probs / legal_probs.sum()
+            else:
+                legal_probs = np.ones(num_legal) / num_legal
+            
+            action_idx = np.random.choice(num_legal, p=legal_probs)
+            action, amount = legal_actions[action_idx]
+            
+            state = game.apply_action(state, action, amount)
+        
+        payoffs = game.get_payoff(state)
+        
+        if agent1_is_player0:
+            agent1_payoff += payoffs[0]
+            agent2_payoff += payoffs[1]
+            if payoffs[0] > payoffs[1]:
+                agent1_wins += 1
+            elif payoffs[1] > payoffs[0]:
+                agent2_wins += 1
+        else:
+            agent1_payoff += payoffs[1]
+            agent2_payoff += payoffs[0]
+            if payoffs[1] > payoffs[0]:
+                agent1_wins += 1
+            elif payoffs[0] > payoffs[1]:
+                agent2_wins += 1
     
     return {
         'iteration1': iteration1,
         'iteration2': iteration2,
         'num_games': num_games,
-        'iteration1_win_rate': result['agent1_win_rate'],
-        'iteration2_win_rate': result['agent2_win_rate'],
-        'iteration1_avg_payoff': result['agent1_payoff'],
-        'iteration2_avg_payoff': result['agent2_payoff'],
-        'full_result': result
+        'iteration1_win_rate': agent1_wins / num_games,
+        'iteration2_win_rate': agent2_wins / num_games,
+        'iteration1_avg_payoff': agent1_payoff / num_games,
+        'iteration2_avg_payoff': agent2_payoff / num_games
     }
 
 

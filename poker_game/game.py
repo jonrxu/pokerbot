@@ -175,7 +175,23 @@ class PokerGame:
     
     def apply_action(self, state: GameState, action: Action, amount: int = 0) -> GameState:
         """Apply an action to the game state."""
+        # Create new state with shallow copy of lists to prevent state corruption
+        # We use list[:] for fast slicing instead of copy.deepcopy() which is slow
         new_state = GameState(**state.__dict__)
+        
+        # Copy mutable lists that are modified in-place or shared
+        new_state.deck = state.deck[:] 
+        new_state.community_cards = state.community_cards[:]
+        # Note: hole_cards is a list of lists/tuples. The outer list needs copying.
+        # The inner items are tuples/lists. If we modify inner items, we need deep copy.
+        # But we usually just read hole cards or replace the whole entry.
+        # Let's be safe for hole_cards since it's small (2 items).
+        new_state.hole_cards = [h[:] if isinstance(h, list) else h for h in state.hole_cards]
+        
+        new_state.betting_history = state.betting_history[:]
+        new_state.stacks = state.stacks[:]
+        new_state.current_bets = state.current_bets[:]
+        
         player = new_state.current_player
         
         if action == Action.FOLD:

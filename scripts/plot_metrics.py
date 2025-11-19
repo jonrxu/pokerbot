@@ -54,28 +54,28 @@ def plot_metrics(output_file=None, show_plot=False):
         # Extract metrics from unique iterations
         sorted_iters = sorted(latest_per_iter.keys())
         
-        # Filter to only show latest run (iterations 1-19, since metrics are 1-indexed)
+        # Filter to only show latest run (iterations 1-50, since metrics are 1-indexed)
         # Metrics are stored with iteration + 1, so iteration 0 in code = iteration 1 in metrics
         # Find the start of the latest run by looking for iteration 1
         if 1 in sorted_iters:
-            # Latest run starts at iteration 1, show first 19 iterations (1-19)
-            latest_run_iters = [it for it in sorted_iters if 1 <= it <= 19]
+            # Latest run starts at iteration 1, show all iterations up to 50
+            latest_run_iters = [it for it in sorted_iters if 1 <= it <= 50]
         else:
-            # If no iteration 1, take the latest 19 iterations
-            latest_run_iters = sorted_iters[-19:] if len(sorted_iters) >= 19 else sorted_iters
+            # If no iteration 1, take the latest 50 iterations
+            latest_run_iters = sorted_iters[-50:] if len(sorted_iters) >= 50 else sorted_iters
         
         # Filter out iterations with invalid metrics (0 or missing values)
         valid_iters = []
-        valid_value_losses = []
+        valid_advantage_losses = []
         valid_policy_losses = []
         
         for it in latest_run_iters:
-            value_loss = latest_per_iter[it].get('value_loss', 0)
+            advantage_loss = latest_per_iter[it].get('advantage_loss', latest_per_iter[it].get('value_loss', 0))
             policy_loss = latest_per_iter[it].get('policy_loss', 0)
             # Only include iterations with valid (non-zero) metrics
-            if value_loss > 0 and policy_loss > 0:
+            if advantage_loss > 0 and policy_loss > 0:
                 valid_iters.append(it)
-                valid_value_losses.append(value_loss)
+                valid_advantage_losses.append(advantage_loss)
                 valid_policy_losses.append(policy_loss)
         
         if len(valid_iters) == 0:
@@ -83,7 +83,7 @@ def plot_metrics(output_file=None, show_plot=False):
             return
         
         iterations = valid_iters
-        value_losses = valid_value_losses
+        advantage_losses = valid_advantage_losses
         policy_losses = valid_policy_losses
         
         # Create figure with two subplots
@@ -119,24 +119,24 @@ def plot_metrics(output_file=None, show_plot=False):
                     verticalalignment='top', 
                     bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.7))
         
-        # Plot Value Loss
-        ax2.plot(iterations, value_losses, 'g-o', linewidth=2.5, markersize=5, 
-                label='Value Loss', alpha=0.8)
+        # Plot Advantage Loss
+        ax2.plot(iterations, advantage_losses, 'g-o', linewidth=2.5, markersize=5, 
+                label='Advantage Loss', alpha=0.8)
         ax2.set_xlabel('Iteration', fontsize=12, fontweight='bold')
-        ax2.set_ylabel('Value Loss', fontsize=12, color='g', fontweight='bold')
-        ax2.set_title('Value Loss Over Time (Prediction Accuracy)', fontsize=14, fontweight='bold')
+        ax2.set_ylabel('Advantage Loss', fontsize=12, color='g', fontweight='bold')
+        ax2.set_title('Advantage Loss Over Time (Regret Prediction)', fontsize=14, fontweight='bold')
         ax2.grid(True, alpha=0.3, linestyle='--')
         ax2.tick_params(axis='y', labelcolor='g')
         
-        # Use log scale for value loss if range is large
-        if max(value_losses) / min([v for v in value_losses if v > 0]) > 100:
+        # Use log scale for advantage loss if range is large
+        if max(advantage_losses) / min([v for v in advantage_losses if v > 0]) > 100:
             ax2.set_yscale('log')
-            ax2.set_ylabel('Value Loss (log scale)', fontsize=12, color='g', fontweight='bold')
+            ax2.set_ylabel('Advantage Loss (log scale)', fontsize=12, color='g', fontweight='bold')
         
-        # Add value loss info
-        val_min = min(value_losses)
-        val_max = max(value_losses)
-        val_current = value_losses[-1]
+        # Add advantage loss info
+        val_min = min(advantage_losses)
+        val_max = max(advantage_losses)
+        val_current = advantage_losses[-1]
         val_info = f'Current: {val_current:.2f}\nRange: {val_min:.2f} - {val_max:.2f}\n(Volatility is normal)'
         ax2.text(0.02, 0.98, val_info, 
                 transform=ax2.transAxes, fontsize=10,
@@ -197,7 +197,7 @@ def plot_metrics(output_file=None, show_plot=False):
         plt.savefig(output_file_str, dpi=150, bbox_inches='tight')
         print(f'✓ Graph saved to: {output_file_str}')
         print(f'  Policy Loss: {policy_losses[0]:.4f} → {policy_losses[-1]:.4f} ({improvement:.1f}% change)')
-        print(f'  Value Loss: {value_losses[0]:.2f} → {value_losses[-1]:.2f}')
+        print(f'  Advantage Loss: {advantage_losses[0]:.4f} → {advantage_losses[-1]:.4f}')
         print(f'  Unique iterations plotted: {len(iterations)}')
         
         if len(eval_iterations) > 0:
