@@ -48,6 +48,10 @@ class DeepCFR:
         # Exploration parameter (Linear CFR exploration floor)
         self.exploration = 0.1
         
+    def set_exploration(self, exploration: float):
+        """Set exploration rate."""
+        self.exploration = exploration
+        
         # Helper for scaling values to neural net range (approx -1 to 1)
         # We use starting stack (20,000 chips) as the scale, so CFVs are O(1).
         self.CFV_SCALE = 20000.0
@@ -64,7 +68,7 @@ class DeepCFR:
             num_actions = len(regrets)
             return {a: 1.0 / num_actions for a in regrets.keys()}
 
-    def get_strategy_from_advantage_net(self, state: GameState, legal_actions: List[Tuple[Action, int]]) -> Dict[int, float]:
+    def get_strategy_from_advantage_net(self, state: GameState, legal_actions: List[Tuple[Action, int]], exploration_rate: float = None) -> Dict[int, float]:
         """Get current exploration strategy using Advantage Network."""
         if not legal_actions:
             return {}
@@ -99,12 +103,13 @@ class DeepCFR:
         
         # Add exploration floor (epsilon-greedy-ish mix)
         # This ensures we don't get stuck in local optima early on
+        epsilon = exploration_rate if exploration_rate is not None else self.exploration
         num_legal = len(legal_actions)
         mixed_strategy = {}
         for idx in range(num_legal):
             mixed_strategy[idx] = (
-                (1 - self.exploration) * strategy.get(idx, 0.0) +
-                (self.exploration * (1.0 / num_legal))
+                (1 - epsilon) * strategy.get(idx, 0.0) +
+                (epsilon * (1.0 / num_legal))
             )
             
         # Normalize
@@ -120,7 +125,8 @@ class DeepCFR:
                                 iteration_weight: float = 1.0,
                                 depth: int = 0,
                                 max_depth: int = 40,
-                                sample_reach: float = 1.0) -> float:
+                                sample_reach: float = 1.0,
+                                exploration_rate: float = None) -> float:
         """
         Traverse the game tree using Outcome Sampling MCCFR.
         
@@ -191,14 +197,14 @@ class DeepCFR:
             next_state = self.game.apply_action(state, action, amount)
             
             # Recursive call
-            return self.traverse_outcome_sampling(next_state, player, buffers, iteration_weight, depth + 1, max_depth, sample_reach)
+            return self.traverse_outcome_sampling(next_state, player, buffers, iteration_weight, depth + 1, max_depth, sample_reach, exploration_rate)
 
         # --- Case 2: Traversal Player Node (Our Turn) ---
         else:
             # Outcome Sampling: Sample ONE action, but compute regrets using Importance Sampling
             
             # 1. Get current strategy from Advantage Net
-            strategy = self.get_strategy_from_advantage_net(state, legal_actions)
+            strategy = self.get_strategy_from_advantage_net(state, legal_actions, exploration_rate)
             
             # Convert strategy dict to list of probs aligned with legal_actions
             strategy_probs = np.zeros(len(legal_actions))
@@ -218,7 +224,7 @@ class DeepCFR:
             
             # 3. Recurse
             next_state = self.game.apply_action(state, action, amount)
-            utility = self.traverse_outcome_sampling(next_state, player, buffers, iteration_weight, depth + 1, max_depth, sample_reach)
+            utility = self.traverse_outcome_sampling(next_state, player, buffers, iteration_weight, depth + 1, max_depth, sample_reach, exploration_rate)
             
             # 4. Compute Regrets (Outcome Sampling Formula)
             # r(I, a) = (u / prob(a)) - u   if a was sampled

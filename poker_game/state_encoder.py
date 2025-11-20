@@ -4,14 +4,7 @@ import numpy as np
 import torch
 from typing import List, Tuple
 from .game import GameState, Action
-
-# Try to import treys for hand evaluation
-try:
-    from treys import Card, Evaluator
-    HAS_TREYS = True
-except ImportError:
-    HAS_TREYS = False
-
+from treys import Card, Evaluator
 
 class StateEncoder:
     """Encodes poker game state into neural network input tensor."""
@@ -22,8 +15,7 @@ class StateEncoder:
     
     def __init__(self):
         self.feature_dim = self._calculate_feature_dim()
-        if HAS_TREYS:
-            self.evaluator = Evaluator()
+        self.evaluator = Evaluator()
     
     def _calculate_feature_dim(self) -> int:
         """Calculate total feature dimension."""
@@ -36,13 +28,11 @@ class StateEncoder:
         # Current bets: 2
         # Hand Strength features:
         # - Strength (normalized rank): 1
-        # - Hand Class (one-hot): 10
+        # - Hand Class (one-hot): 10 (actually 9 classes for treys, but let's keep 10 for safety/padding)
         return 34 + 85 + (self.MAX_HISTORY * 2) + 4 + 1 + 1 + 2 + 1 + 10
     
     def _get_treys_card(self, rank: int, suit: int):
         """Convert internal card representation to treys Card."""
-        if not HAS_TREYS:
-            return 0
         # rank 0..12 -> '2'..'A'
         # suit 0..3 -> 's','h','d','c'
         r_char = '23456789TJQKA'[rank]
@@ -126,45 +116,47 @@ class StateEncoder:
         hand_strength = 0.0
         hand_class_onehot = np.zeros(10)
         
-        if HAS_TREYS:
-            try:
-                hole = [self._get_treys_card(r, s) for r, s in hole_cards]
-                board = [self._get_treys_card(r, s) for r, s in state.community_cards]
+        try:
+            hole = [self._get_treys_card(r, s) for r, s in hole_cards]
+            board = [self._get_treys_card(r, s) for r, s in state.community_cards]
+            
+            if len(board) >= 3:
+                # Post-flop: Use full evaluation
+                rank = self.evaluator.evaluate(board, hole)
+                # rank is 1 (best) to 7462 (worst)
+                # Normalize to 0.0 - 1.0 (1.0 is best)
+                hand_strength = 1.0 - (rank / 7462.0)
                 
-                if len(board) >= 3:
-                    # Post-flop: Use full evaluation
-                    rank = self.evaluator.evaluate(board, hole)
-                    # rank is 1 (best) to 7462 (worst)
-                    # Normalize to 0.0 - 1.0 (1.0 is best)
-                    hand_strength = 1.0 - (rank / 7462.0)
-                    
-                    rank_class = self.evaluator.get_rank_class(rank)
-                    # treys returns 1 (Royal Flush) to 9 (High Card)
-                    # We map 1->9 (index 9), 9->1 (index 1), or just use index = 10 - rank_class
-                    # Let's just use 0-based index: index = rank_class - 1
-                    if 1 <= rank_class <= 10:
-                         hand_class_onehot[rank_class - 1] = 1.0
-                         
-                else:
-                    # Pre-flop: Heuristics
-                    r1, s1 = hole_cards[0]
-                    r2, s2 = hole_cards[1]
-                    
-                    # Pair
-                    if r1 == r2:
-                        hand_strength = 0.5 + (r1 / 26.0) # 0.5 to 1.0 approx
-                        hand_class_onehot[8] = 1.0 # Treat as "Pair" class (index 8 for Pair in standard list usually)
-                    else:
-                        high_card = max(r1, r2)
-                        hand_strength = high_card / 26.0 # 0.0 to 0.5 approx
-                        hand_class_onehot[9] = 1.0 # High Card
+                rank_class = self.evaluator.get_rank_class(rank)
+                # treys returns 1 (Straight Flush) to 9 (High Card)
+                # Map to 0-based index: index = rank_class - 1
+                # 1 -> 0 (Straight Flush)
+                # ...
+                # 8 -> 7 (Pair)
+                # 9 -> 8 (High Card)
+                if 1 <= rank_class <= 9:
+                        hand_class_onehot[rank_class - 1] = 1.0
                         
-                        # Suited bonus
-                        if s1 == s2:
-                            hand_strength += 0.05
-            except Exception:
-                # Fallback if evaluation fails
-                pass
+            else:
+                # Pre-flop: Heuristics
+                r1, s1 = hole_cards[0]
+                r2, s2 = hole_cards[1]
+                
+                # Pair
+                if r1 == r2:
+                    hand_strength = 0.5 + (r1 / 26.0) # 0.5 to 1.0 approx
+                    hand_class_onehot[7] = 1.0 # Pair (Index 7)
+                else:
+                    high_card = max(r1, r2)
+                    hand_strength = high_card / 26.0 # 0.0 to 0.5 approx
+                    hand_class_onehot[8] = 1.0 # High Card (Index 8)
+                    
+                    # Suited bonus
+                    if s1 == s2:
+                        hand_strength += 0.05
+        except Exception:
+            # Should not happen if treys is installed, but safe fallback
+            pass
         
         features.append(hand_strength)
         features.extend(hand_class_onehot)

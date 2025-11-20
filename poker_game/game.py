@@ -140,6 +140,14 @@ class PokerGame:
 
                 # Pot bet (at least min_bet)
                 pot_size = max(min_bet, state.pot)
+                
+                # Add fractional pot bets (0.5x, 0.75x)
+                # Ensure they are at least min_bet
+                half_pot = max(min_bet, int(state.pot * 0.5))
+                three_quarter_pot = max(min_bet, int(state.pot * 0.75))
+                
+                bet_candidates.add(half_pot)
+                bet_candidates.add(three_quarter_pot)
                 bet_candidates.add(pot_size)
 
                 # All-in
