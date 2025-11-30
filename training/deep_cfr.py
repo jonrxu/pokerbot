@@ -73,29 +73,47 @@ class DeepCFR:
             return {a: 1.0 / num_actions for a in regrets.keys()}
     
     def get_strategy(self, info_set: InformationSet, legal_actions: List[Tuple[Action, int]]) -> Dict[int, float]:
-        """Get current strategy for an information set."""
+        """Get current strategy for an information set (returns index -> probability mapping)."""
         key = info_set.key
-        
+
         # Get regrets for this information set
         regrets = self.regret_memory[key]
-        
+
         # If no regrets yet, return uniform
         if not regrets or len(regrets) != len(legal_actions):
             return {i: 1.0 / len(legal_actions) for i in range(len(legal_actions))}
-        
+
         # Filter regrets to only include valid indices (0 to len(legal_actions)-1)
         # This handles cases where regret_memory has stale indices from different states
         # that share the same information set but have different legal actions
         max_valid_idx = len(legal_actions) - 1
-        valid_regrets = {idx: regret for idx, regret in regrets.items() 
+        valid_regrets = {idx: regret for idx, regret in regrets.items()
                         if 0 <= idx <= max_valid_idx}
-        
+
         # If no valid regrets, return uniform
         if not valid_regrets:
             return {i: 1.0 / len(legal_actions) for i in range(len(legal_actions))}
-        
+
         # Regret matching on valid regrets only
         return self.regret_matching(valid_regrets)
+
+    def get_action_strategy(self, info_set: InformationSet,
+                           legal_actions: List[Tuple[Action, int]]) -> Dict[Tuple[Action, int], float]:
+        """Get current strategy for an information set (returns action -> probability mapping).
+
+        This is a convenience method that returns strategies in action-based format
+        for easier sampling.
+        """
+        # Get index-based strategy
+        index_strategy = self.get_strategy(info_set, legal_actions)
+
+        # Convert to action-based strategy
+        action_strategy = {}
+        for idx, prob in index_strategy.items():
+            if idx < len(legal_actions):
+                action_strategy[legal_actions[idx]] = prob
+
+        return action_strategy
     
     def sample_action(self, strategy: Dict[int, float]) -> int:
         """Sample an action from strategy distribution."""
@@ -181,35 +199,116 @@ class DeepCFR:
         
         return clipped_node_value, trajectory_data
     
+    def train_value_network(self, value_buffer: List[Dict], batch_size: int = 32) -> float:
+        """Train value network from buffer of state-value pairs.
+
+        Args:
+            value_buffer: List of dicts with 'state' and 'target' keys
+            batch_size: Batch size for training
+
+        Returns:
+            Loss value (float)
+        """
+        if len(value_buffer) == 0:
+            return 0.0
+
+        # Sample batch
+        num_samples = min(batch_size, len(value_buffer))
+        indices = np.random.choice(len(value_buffer), num_samples, replace=False)
+
+        batch_states = [value_buffer[i]['state'] for i in indices]
+        batch_targets = [value_buffer[i]['target'] for i in indices]
+
+        states_tensor = torch.tensor(np.stack(batch_states), dtype=torch.float32).to(self.device)
+        targets_tensor = torch.tensor(batch_targets, dtype=torch.float32).to(self.device).unsqueeze(1)
+
+        self.value_optimizer.zero_grad()
+        predicted_values, _ = self.value_net(states_tensor)
+        value_loss = nn.MSELoss()(predicted_values, targets_tensor)
+        value_loss.backward()
+        self.value_optimizer.step()
+
+        return value_loss.item()
+
+    def train_policy_network(self, policy_buffer: List[Dict], batch_size: int = 32) -> float:
+        """Train policy network from buffer of state-strategy pairs.
+
+        Args:
+            policy_buffer: List of dicts with 'state', 'strategy', and 'legal_actions' keys
+            batch_size: Batch size for training
+
+        Returns:
+            Loss value (float)
+        """
+        if len(policy_buffer) == 0:
+            return 0.0
+
+        # Sample batch
+        num_samples = min(batch_size, len(policy_buffer))
+        indices = np.random.choice(len(policy_buffer), num_samples, replace=False)
+
+        batch_states = []
+        batch_targets = []
+
+        for i in indices:
+            state = policy_buffer[i]['state']
+            strategy = policy_buffer[i]['strategy']  # Dict[int, float]
+            legal_actions = policy_buffer[i]['legal_actions']
+
+            # Convert strategy to target distribution
+            target_probs = np.zeros(self.policy_net.max_actions)
+            for action_idx, prob in strategy.items():
+                if action_idx < len(legal_actions):
+                    target_probs[action_idx] = prob
+
+            batch_states.append(state)
+            batch_targets.append(target_probs)
+
+        states_tensor = torch.tensor(np.stack(batch_states), dtype=torch.float32).to(self.device)
+        targets_tensor = torch.tensor(np.stack(batch_targets), dtype=torch.float32).to(self.device)
+
+        self.policy_optimizer.zero_grad()
+        _, policy_logits = self.policy_net(states_tensor)
+
+        # Use KL divergence loss
+        policy_probs = torch.softmax(policy_logits, dim=1)
+        kl_loss = nn.KLDivLoss(reduction='batchmean')(
+            torch.log(policy_probs + 1e-8), targets_tensor
+        )
+        kl_loss.backward()
+        self.policy_optimizer.step()
+
+        return kl_loss.item()
+
     def update_networks(self, batch_size: int = 32):
         """Update value and policy networks from buffers."""
         if len(self.value_buffer) == 0 and len(self.policy_buffer) == 0:
             return
-        
+
         # Update value network
         if len(self.value_buffer) >= batch_size:
             indices = np.random.choice(len(self.value_buffer), batch_size, replace=False)
             batch_states = [self.value_buffer[i][0] for i in indices]
             batch_values = [self.value_buffer[i][1] for i in indices]
-            
+
             states_tensor = torch.tensor(np.stack(batch_states), dtype=torch.float32).to(self.device)
             values_tensor = torch.tensor(batch_values, dtype=torch.float32).to(self.device).unsqueeze(1)
-            
+
             self.value_optimizer.zero_grad()
             predicted_values, _ = self.value_net(states_tensor)
             value_loss = nn.MSELoss()(predicted_values, values_tensor)
             value_loss.backward()
             self.value_optimizer.step()
-        
+
         # Update policy network
         if len(self.policy_buffer) >= batch_size:
             indices = np.random.choice(len(self.policy_buffer), batch_size, replace=False)
             batch_states = [self.policy_buffer[i][0] for i in indices]
             batch_probs = [self.policy_buffer[i][1] for i in indices]
-            
+
             states_tensor = torch.tensor(np.stack(batch_states), dtype=torch.float32).to(self.device)
             probs_tensor = torch.tensor(np.stack(batch_probs), dtype=torch.float32).to(self.device)
-            
+
             self.policy_optimizer.zero_grad()
             _, policy_logits = self.policy_net(states_tensor)
             policy_loss = nn.CrossEntropyLoss()(policy_logits, probs_tensor.argmax(dim=1))
@@ -237,6 +336,24 @@ class DeepCFR:
             # Uniform if no strategy accumulated
             return {i: 1.0 / len(legal_actions) for i in range(len(legal_actions))}
     
+    def get_average_strategy(self, info_set: InformationSet,
+                           legal_actions: List[Tuple[Action, int]]) -> Dict[Tuple[Action, int], float]:
+        """Get average strategy for an information set (returns action -> probability mapping).
+
+        This is a convenience method that returns strategies in the format expected by
+        the exploitative trainer (mapping actions to probabilities rather than indices).
+        """
+        # Get index-based strategy
+        index_strategy = self.compute_average_strategy(info_set, legal_actions)
+
+        # Convert to action-based strategy
+        action_strategy = {}
+        for idx, prob in index_strategy.items():
+            if idx < len(legal_actions):
+                action_strategy[legal_actions[idx]] = prob
+
+        return action_strategy
+
     def get_average_policy(self, state: GameState, player: int) -> Dict[int, float]:
         """Get average policy for current state."""
         info_set = get_information_set(state, player)
